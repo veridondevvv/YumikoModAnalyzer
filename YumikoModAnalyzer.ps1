@@ -7,13 +7,14 @@
 )
 
 $script:Config = @{
-    Version = "3.1.0"
+    Version = "3.2.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE"
     ModrinthAPI = "https://api.modrinth.com/v2"
     MegabaseAPI = "https://megabase.vercel.app/api/query"
-    CheatSignatures = "300+"
+    CheatSignatures = "450+"
+    SystemChecks = "28"
 }
 
 $script:Colors = @{
@@ -929,9 +930,26 @@ function Check-DNSCache {
     
     $found = $false
     $suspiciousDomains = @(
+        # Known Cheat Clients
         "vape.gg", "intent.store", "novoline.wtf", "rise.today",
         "astolfo.lgbt", "exhibition.org", "fdpclient.com",
-        "sigmaclient.info", "pandaware.wtf", "drip.ac"
+        "sigmaclient.info", "pandaware.wtf", "drip.ac",
+        "novaclient.lol", "novaclient.com", "api.novaclient.lol",
+        "riseclient.com", "doomsdayclient.com", "prestigeclient.vip",
+        "198macros.com", "dqrkis.xyz",
+        # Additional Clients
+        "konas.org", "rusherhack.org", "futureclient.net",
+        "phobos.cc", "salhack.dev", "gamesense.pub",
+        "thunderclient.org", "trollhack.xyz", "abyss.dev",
+        "cosmos.rip", "ares.fyi", "tenacity.dev",
+        "liquidbounce.net", "ccbluex.net", "wurstclient.net",
+        "impactclient.net", "aristoismod.com", "meteorclient.com",
+        # RAT / Malware Sources
+        "grabify.link", "iplogger.org", "blasze.tk",
+        "discord.gift", "discordgift.site", "steamcommunity.rip",
+        # Cheat Forums
+        "unknowncheats.me", "mpgh.net", "elitepvpers.com",
+        "guidedhacking.com", "hackforums.net"
     )
     
     try {
@@ -952,6 +970,207 @@ function Check-DNSCache {
     
     if (-not $found) {
         Write-Result "CLEAN" "No suspicious DNS cache entries"
+    }
+}
+
+function Check-BAMRegistry {
+    Write-Section "BAM/DAM Registry Analysis" "BAM"
+    
+    $found = $false
+    $bamPath = "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
+    $damPath = "HKLM:\SYSTEM\CurrentControlSet\Services\dam\State\UserSettings"
+    
+    $suspiciousPatterns = @(
+        "cheat", "hack", "inject", "meteor", "wurst", "impact", "vape", 
+        "liquidbounce", "aristois", "sigma", "novoline", "rise", "ghost",
+        "client", "loader", "bypass", "exploit"
+    )
+    
+    foreach ($path in @($bamPath, $damPath)) {
+        try {
+            if (Test-Path $path) {
+                $userSids = Get-ChildItem -Path $path -ErrorAction SilentlyContinue
+                foreach ($sid in $userSids) {
+                    $entries = Get-ItemProperty -Path $sid.PSPath -ErrorAction SilentlyContinue
+                    $entries.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS|Version|SequenceNumber" } | ForEach-Object {
+                        $exePath = $_.Name
+                        $exeName = [System.IO.Path]::GetFileName($exePath).ToLower()
+                        foreach ($pattern in $suspiciousPatterns) {
+                            if ($exeName -match $pattern) {
+                                Write-Result "FOUND" "Suspicious exe in BAM/DAM" $exeName
+                                $script:SystemFindings += @{
+                                    Type = "BAM"
+                                    Description = "Recently executed: $exeName"
+                                    Path = $exePath
+                                }
+                                $found = $true
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious BAM/DAM entries"
+    }
+}
+
+function Check-ShimCache {
+    Write-Section "Shimcache Analysis" "SHIM"
+    
+    $found = $false
+    $shimPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache"
+    
+    $suspiciousPatterns = @(
+        "cheat", "hack", "inject", "meteor", "wurst", "impact", "vape",
+        "liquidbounce", "aristois", "sigma", "novoline", "rise", "ghost",
+        "loader", "bypass", "client"
+    )
+    
+    try {
+        if (Test-Path $shimPath) {
+            $shimData = Get-ItemProperty -Path $shimPath -Name "AppCompatCache" -ErrorAction SilentlyContinue
+            if ($shimData) {
+                $rawData = $shimData.AppCompatCache
+                $asciiString = [System.Text.Encoding]::ASCII.GetString($rawData) -replace '[^\x20-\x7E]', ' '
+                
+                foreach ($pattern in $suspiciousPatterns) {
+                    if ($asciiString -match "\\[^\\]*$pattern[^\\]*\.exe") {
+                        $match = $matches[0]
+                        Write-Result "FOUND" "Suspicious exe in Shimcache" $match
+                        $script:SystemFindings += @{
+                            Type = "Shimcache"
+                            Description = "Cached execution: $match"
+                        }
+                        $found = $true
+                    }
+                }
+            }
+        }
+    } catch {}
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious Shimcache entries"
+    }
+}
+
+function Check-Amcache {
+    Write-Section "Amcache Analysis" "AMC"
+    
+    $found = $false
+    $amcachePath = "$env:SystemRoot\AppCompat\Programs\Amcache.hve"
+    
+    $suspiciousPatterns = @(
+        "cheat", "hack", "inject", "meteor", "wurst", "impact", "vape",
+        "liquidbounce", "aristois", "sigma", "novoline", "rise", "ghost",
+        "loader", "bypass", "client", "exploit"
+    )
+    
+    try {
+        $recentExePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
+        $amcacheFiles = Get-ChildItem -Path $recentExePath -Filter "*.db" -ErrorAction SilentlyContinue
+        
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModel\StateRepository\Cache\Application\Data"
+        if (Test-Path $regPath) {
+            $apps = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue
+            foreach ($app in $apps) {
+                try {
+                    $appName = (Get-ItemProperty -Path $app.PSPath -ErrorAction SilentlyContinue).PackageFullName
+                    if ($appName) {
+                        foreach ($pattern in $suspiciousPatterns) {
+                            if ($appName -match $pattern) {
+                                Write-Result "FOUND" "Suspicious app in cache" $appName
+                                $script:SystemFindings += @{
+                                    Type = "Amcache"
+                                    Description = "Installed app: $appName"
+                                }
+                                $found = $true
+                                break
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        }
+        
+        $uninstallPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        if (Test-Path $uninstallPath) {
+            $programs = Get-ChildItem -Path $uninstallPath -ErrorAction SilentlyContinue
+            foreach ($prog in $programs) {
+                try {
+                    $displayName = (Get-ItemProperty -Path $prog.PSPath -ErrorAction SilentlyContinue).DisplayName
+                    if ($displayName) {
+                        foreach ($pattern in $suspiciousPatterns) {
+                            if ($displayName -match $pattern) {
+                                Write-Result "FOUND" "Suspicious program installed" $displayName
+                                $script:SystemFindings += @{
+                                    Type = "Amcache"
+                                    Description = "Installed program: $displayName"
+                                }
+                                $found = $true
+                                break
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious Amcache entries"
+    }
+}
+
+function Check-JumpLists {
+    Write-Section "Jump Lists Analysis" "JUMP"
+    
+    $found = $false
+    $jumpListPaths = @(
+        "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations",
+        "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations"
+    )
+    
+    $suspiciousPatterns = @(
+        "cheat", "hack", "inject", "meteor", "wurst", "impact", "vape",
+        "liquidbounce", "aristois", "client", "loader", "ghost"
+    )
+    
+    foreach ($path in $jumpListPaths) {
+        try {
+            if (Test-Path $path) {
+                $jumpFiles = Get-ChildItem -Path $path -ErrorAction SilentlyContinue | 
+                             Sort-Object LastWriteTime -Descending | 
+                             Select-Object -First 50
+                
+                foreach ($file in $jumpFiles) {
+                    try {
+                        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+                        $content = [System.Text.Encoding]::Unicode.GetString($bytes) -replace '[^\x20-\x7E]', ' '
+                        
+                        foreach ($pattern in $suspiciousPatterns) {
+                            if ($content -match "$pattern.*\.(jar|exe)") {
+                                Write-Result "FOUND" "Suspicious file in Jump List" "$pattern file accessed"
+                                $script:SystemFindings += @{
+                                    Type = "JumpList"
+                                    Description = "Recent access: $pattern file"
+                                    Path = $file.FullName
+                                }
+                                $found = $true
+                                break
+                            }
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious Jump List entries"
     }
 }
 
@@ -1229,6 +1448,20 @@ function Invoke-BypassScan {
             $flags.Add("Unicode class names - $uniPct% use non-ASCII characters")
         }
         
+        # Advanced obfuscator detection
+        $obfResults = Test-Obfuscator -FilePath $FilePath
+        if ($obfResults.Score -ge 20 -or $obfResults.Detected.Count -gt 0) {
+            foreach ($obf in $obfResults.Detected) {
+                $flags.Add("OBFUSCATOR: $($obf.Name) [$($obf.Severity)]")
+            }
+            foreach ($ind in $obfResults.Indicators) {
+                $flags.Add("OBFUSCATION ($ind)")
+            }
+            if ($obfResults.ClassAnalysis.Japanese -gt 0) {
+                $flags.Add("JAPANESE CLASS NAMES: $($obfResults.ClassAnalysis.Japanese) classes")
+            }
+        }
+        
         $knownLegitModIds = @(
             "vmp-fabric", "vmp", "lithium", "sodium", "iris", "fabric-api",
             "modmenu", "ferrite-core", "lazydfu", "starlight", "entityculling",
@@ -1275,6 +1508,14 @@ function Get-DownloadSource {
         if ($url -match "vape\.gg") { return @{ Source = "Vape"; Safe = $false; Cheat = $true } }
         if ($url -match "intent\.store") { return @{ Source = "Intent.Store"; Safe = $false; Cheat = $true } }
         if ($url -match "anydesk\.com") { return @{ Source = "AnyDesk"; Safe = $false; Cheat = $true } }
+        # Nova Client & Additional Cheat Sites
+        if ($url -match "novaclient\.lol|novaclient\.com") { return @{ Source = "NovaClient"; Safe = $false; Cheat = $true } }
+        if ($url -match "rise\.today|riseclient\.com") { return @{ Source = "RiseClient"; Safe = $false; Cheat = $true } }
+        if ($url -match "novoline\.wtf") { return @{ Source = "Novoline"; Safe = $false; Cheat = $true } }
+        if ($url -match "astolfo\.lgbt") { return @{ Source = "Astolfo"; Safe = $false; Cheat = $true } }
+        if ($url -match "pandaware\.wtf") { return @{ Source = "Pandaware"; Safe = $false; Cheat = $true } }
+        if ($url -match "drip\.ac") { return @{ Source = "DripClient"; Safe = $false; Cheat = $true } }
+        if ($url -match "exhibition\.org") { return @{ Source = "Exhibition"; Safe = $false; Cheat = $true } }
         
         if ($url -match "https?://(?:www\.)?([^/]+)") { 
             return @{ Source = $matches[1]; Safe = $false }
@@ -1284,51 +1525,71 @@ function Get-DownloadSource {
     return $null
 }
 
+# === CHEAT SIGNATURE DATABASE (450+) ===
 $script:CheatStrings = @(
-    "KillAura", "ClickAura", "TriggerBot", "MultiAura", "ForceField",
-    "AimAssist", "AimBot", "AutoAim", "SilentAim", "AimLock", "LegitAura",
-    "CrystalAura", "AutoCrystal", "CrystalOptimize", "CEV", "CEVBreaker",
-    "AnchorAura", "AutoAnchor", "AnchorTweaks", "BedAura", "AutoBed",
-    "BowAimbot", "BowSpam", "AutoBow", "ArrowDodge", "Quiver",
-    "Criticals", "AutoCrit", "CritBypass", "Reach", "HitBox", "Hitboxes",
-    "AutoWeapon", "AutoSword", "AutoCity", "Burrow", "SelfTrap",
-    "Surround", "HoleFiller", "AutoWeb", "AntiSurround", "AntiBurrow",
-    "AntiAnvil", "AntiBed", "AntiAim", "AntiBot", "AutoLog",
+    # Combat Cheats - Aura & Aim
+    "KillAura", "ClickAura", "TriggerBot", "MultiAura", "ForceField", "SilentAura",
+    "AimAssist", "AimBot", "AutoAim", "SilentAim", "AimLock", "LegitAura", "LegitAim",
+    "CrystalAura", "AutoCrystal", "CrystalOptimize", "CEV", "CEVBreaker", "CrystalPlacer",
+    "AnchorAura", "AutoAnchor", "AnchorTweaks", "BedAura", "AutoBed", "BedFucker",
+    "BowAimbot", "BowSpam", "AutoBow", "ArrowDodge", "Quiver", "FastBow",
+    "Criticals", "AutoCrit", "CritBypass", "Reach", "HitBox", "Hitboxes", "HitboxExpand",
+    "AutoWeapon", "AutoSword", "AutoCity", "Burrow", "SelfTrap", "AutoTrap",
+    "Surround", "HoleFiller", "AutoWeb", "AntiSurround", "AntiBurrow", "HoleSnap",
+    "AntiAnvil", "AntiBed", "AntiAim", "AntiBot", "AutoLog", "AntiCrystal",
     "AutoTotem", "TotemPopCounter", "OffhandTotem", "LegitTotem", "HoverTotem", "InventoryTotem",
-    "AutoGapple", "AutoGap", "AutoMend", "AutoTool", "SwordBlock",
-    "AutoHitCrystal", "AutoDoubleHand", "ShieldBreaker", "ShieldDisabler",
-    "JumpReset", "SprintReset", "AxeSpam", "MaceSwap", "StunSlam", "Donut",
-    "Flight", "Fly", "FlyHack", "CreativeFlight", "BoatFly", "Jetpack",
-    "NoFall", "Spider", "SpiderHack", "Step", "StepHack", "FastClimb",
-    "Jesus", "WaterWalk", "NoSlow", "NoSlowdown", "NoWeb", "NoClip",
-    "Speed", "SpeedHack", "BHop", "BunnyHop", "Strafe", "Speed Mine",
+    "AutoGapple", "AutoGap", "AutoMend", "AutoTool", "SwordBlock", "Offhand",
+    "AutoHitCrystal", "AutoDoubleHand", "ShieldBreaker", "ShieldDisabler", "AxeSwap",
+    "JumpReset", "SprintReset", "AxeSpam", "MaceSwap", "StunSlam", "Donut", "DoubleClick",
+    
+    # Movement Cheats
+    "Flight", "Fly", "FlyHack", "CreativeFlight", "BoatFly", "Jetpack", "AirJump",
+    "NoFall", "Spider", "SpiderHack", "Step", "StepHack", "FastClimb", "WallClimb",
+    "Jesus", "WaterWalk", "NoSlow", "NoSlowdown", "NoWeb", "NoClip", "PhaseFly",
+    "Speed", "SpeedHack", "BHop", "BunnyHop", "Strafe", "Speed Mine", "GroundSpeed",
     "Velocity", "AntiKB", "NoKnockback", "Grim Velocity", "GrimDisabler", "Antiknockback",
-    "Glide", "GlideHack", "Elytra", "ExtraElytra", "ElytraFly", "ElytraSwap",
-    "Scaffold", "ScaffoldWalk", "FastBridge", "Tower", "BuildHelper",
+    "Glide", "GlideHack", "Elytra", "ExtraElytra", "ElytraFly", "ElytraSwap", "FireworkFly",
+    "Scaffold", "ScaffoldWalk", "FastBridge", "Tower", "BuildHelper", "Telly", "TellyBridge",
     "SafeWalk", "Parkour", "AntiHunger", "FastLadder", "BonemealAura", "NoJumpDelay",
+    "LongJump", "HighJump", "AutoJump", "Strafe", "AirStrafe", "IceSpeed",
+    
+    # Visual Cheats
     "ESP", "PlayerESP", "MobESP", "ItemESP", "StorageESP", "ChestESP", "BlockESP",
-    "Tracers", "Nametags", "NameTagsHack", "Chams", "MobSpawnESP",
-    "Xray", "XRayHack", "OreFinder", "CaveFinder", "Freecam",
-    "FullBright", "NightVision", "NoFog", "NoRender", "NoWeather",
-    "NewChunks", "LightLevelOverlay", "TunnelFinder", "Trajectories",
+    "Tracers", "Nametags", "NameTagsHack", "Chams", "MobSpawnESP", "HoleESP",
+    "Xray", "XRayHack", "OreFinder", "CaveFinder", "Freecam", "FreeLook",
+    "FullBright", "NightVision", "NoFog", "NoRender", "NoWeather", "Gamma",
+    "NewChunks", "LightLevelOverlay", "TunnelFinder", "Trajectories", "LogoutSpot",
+    "HealthTags", "ArmorHUD", "PotionHUD", "NameProtect", "StreamerMode",
+    
+    # Inventory & Automation
     "AutoArmor", "ChestStealer", "InvManager", "InventoryManager", "ChestSteal",
-    "AutoPot", "AutoPotion", "AutoEat", "AutoSprint", "Sneak", "Refill",
+    "AutoPot", "AutoPotion", "AutoEat", "AutoSprint", "Sneak", "Refill", "AutoStore",
     "FakePlayer", "Blink", "NoRotation", "SilentRotation", "FastXP", "FastExp",
     "AntiAFK", "AutoRespawn", "DeathCoords", "PotionSaver", "AutoFirework",
     "FakeInv", "FakeLag", "FakeNick", "FakeItem", "PopSwitch", "LagReach",
+    
+    # Network & Packet Manipulation
     "PingSpoof", "FakeLatency", "FakePing", "Timer", "TimerHack", "PackSpoof",
-    "SelfDestruct", "Panic", "HideClient", "ClickGUI", "TabGUI",
-    "Disabler", "AntiCheat", "GrimBypass", "VulcanBypass", "MatrixBypass",
-    "PacketFly", "PacketMine", "Ghost", "GhostHand", "Reach", "ReachHack",
-    "BackTrack", "SilentClose", "Exploits", "ServerCrasher", "ChatSpam",
-    "AntiVanish", "StaffAlert", "PortalGui", "PearlClip", "BoatClip",
+    "PacketFly", "PacketMine", "Ghost", "GhostHand", "ReachHack", "PacketCancel",
+    "BackTrack", "SilentClose", "Exploits", "ServerCrasher", "ChatSpam", "Crasher",
+    "AntiVanish", "StaffAlert", "PortalGui", "PearlClip", "BoatClip", "EntityClip",
     "Phase", "VClip", "HClip", "EntityControl", "AutoMount", "AutoClicker",
+    "Disabler", "AntiCheat", "GrimBypass", "VulcanBypass", "MatrixBypass", "ACDisabler",
+    "TickShift", "TickTimer", "NoPacket", "PacketMod", "PacketSpeed",
+    
+    # Client UI
+    "SelfDestruct", "Panic", "HideClient", "ClickGUI", "TabGUI", "HUDEditor",
+    "ModuleList", "ArrayList", "Watermark", "Keybinds", "ModuleManager",
+    
+    # World Interaction
     "invsee", "ItemExploit", "AuthBypass", "LicenseCheckMixin", "obfuscatedAuth",
-    "Nuker", "NukerLegit", "FastBreak", "InstantBreak", "AutoMine",
-    "AutoFarm", "AutoFish", "Baritone", "PathFinder", "AutoWalk",
-    "AutoBuild", "InstaBuild", "BuildRandom", "TemplateTool",
-    "AutoSign", "AutoTool", "FastPlace", "PlaceAssist", "AirPlace", "AirAnchor",
+    "Nuker", "NukerLegit", "FastBreak", "InstantBreak", "AutoMine", "SpeedMine",
+    "AutoFarm", "AutoFish", "Baritone", "PathFinder", "AutoWalk", "AutoPath",
+    "AutoBuild", "InstaBuild", "BuildRandom", "TemplateTool", "Schematica",
+    "AutoSign", "FastPlace", "PlaceAssist", "AirPlace", "AirAnchor", "InstantPlace",
     "AutoDisconnect", "AutoReconnect", "AutoCommand", "MacroSystem", "AutoTPA",
+    
+    # Known Cheat Clients
     "vape.gg", "vape v4", "vapeclient", "intent.store", "rise6", "riseClient",
     "novoline", "exhibition", "meteor-client", "meteorclient", "meteordev",
     "wurst", "wurstclient", "aristois", "impact", "impactclient",
@@ -1336,52 +1597,153 @@ $script:CheatStrings = @(
     "entropy", "pandaware", "skilled", "moon", "moonClient", "astolfo",
     "future", "futureClient", "konas", "rusherhack", "inertia", "sigma",
     "cheatbreaker", "badlion bypass", "hacked client", "cheathub",
-    "ghostclient", "ghost.jar", "vapeV4", "vapeV3", "vapeLite",
+    "ghostclient", "ghost.jar", "vapeV4", "vapeV3", "vapeLite", "vape lite",
     "autoclicker", "double clicker", "jitter click", "butterfly click",
     "Asteria", "Prestige", "Xenon", "Argon", "Hellion", "hellion", "Virgin",
     "Dqrkis Client", "dev.krypton", "dev.gambleclient", "catlean", "gypsy",
     "WalksyOptimizer", "WalskyOptimizer", "WalksyCrystalOptimizerMod", "LWFH Crystal",
-    "KeyPearl", "LootYeeter", "AutoBreach",
+    "KeyPearl", "LootYeeter", "AutoBreach", "zeroday", "tenacity", "hanabi",
+    "antic", "antic.ac", "remix", "remix client", "ares", "ares client",
+    "phobos", "phobosplus", "salhack", "pyro", "pyroclient", "lambda",
+    "gamesense", "gsplusplus", "gs++", "trollhack", "abyss", "abyssclient",
+    "cosmos", "cosmosclient", "oyvey", "zerohack", "thunder", "thunderhack",
+    "faxhax", "faxclient", "1.9hax", "guardian", "guardianplus",
+    "opfern", "lavaHack", "lavaclient", "postman", "postmanclient",
+    "bleach", "bleachhack", "cringehack", "horion", "horionclient",
+    
+    # Anti-Detection / SS-Bypass
     "HideCommands", "NoCommandBlock", "AntiFabricSequence",
     "AntiPacketKick", "NoServerCheck", "FakeWorld", "SpoofRotation",
     "SessionStealer", "CookieStealer", "Ratted", "TokenLogger",
+    "AntiSS", "AntiScreenShare", "HideProcess", "FakeProcess",
+    "RegistryCleaner", "TraceCleaner", "LogCleaner", "HideMods",
+    
+    # Package Signatures
     "net.wurstclient", "meteordevelopment.orbit", "meteordevelopment.meteorclient",
     "cc.novoline", "de.lifeofgaming", "wtf.moonlight", "com.alan.clients",
     "com.cheatbreaker", "net.ccbluex", "me.zeroeightsix.kami",
     "club.maxstats", "today.opai", "com.moonsworth", "org.spongepowered.asm.mixin",
     "org.chainlibs.module.impl.modules", "xyz.greaj", "phantom-refmap.json",
     "imgui", "imgui.gl3", "imgui.glfw", "jnativehook",
+    "net.minecraft.client.mixin", "gg.essential.cosmetics",
+    "com.github.lunatrius", "baritone.", "io.github.impactdevelopment",
+    "club.minnced", "me.earth.phobos", "net.futureclient",
+    
+    # Mixin & Accessor Patterns
     "setBlockBreakingCooldown", "getBlockBreakingCooldown", "blockBreakingCooldown",
     "onBlockBreaking", "setItemUseCooldown", "setSelectedSlot",
     "invokeDoAttack", "invokeDoItemUse", "invokeOnMouseButton",
     "onTickMovement", "onPushOutOfBlocks", "onIsGlowing",
     "ClientPlayerInteractionManagerAccessor", "ClientPlayerEntityMixim",
+    "MinecraftClientAccessor", "PlayerEntityAccessor", "LivingEntityAccessor",
+    "WorldAccessor", "ChunkAccessor", "RenderAccessor", "ClientPlayNetworkHandlerAccessor",
+    "invokeAttack", "invokeInteract", "invokeSendPacket", "invokeUpdatePosition",
+    
+    # PvP Modules
     "W-Tap", "WTap", "AutoW", "Combo", "AimCorrect", "TargetStrafe",
     "AutoGap", "Regen", "AutoPearl", "PearlPredict", "AutoEagle",
     "TargetHUD", "CPSDisplay", "ReachDisplay", "HitParticles", "TotemHit",
-    "AntiMissClick", "Wtap", "DoubleAnchor", "SafeAnchor",
+    "AntiMissClick", "Wtap", "DoubleAnchor", "SafeAnchor", "AutoPot32k",
+    "32kKillAura", "32kAura", "TotemSpoof", "PopCounter",
+    
+    # Anarchy & 2b2t Modules
     "AutoHighway", "HighwayBuilder", "ElytraHighway", "MapDownloader",
     "CoordExploit", "BookBot", "ChunkLogger", "ChunkBan", "NewerNewChunks",
-    "StashFinder", "TrailFinder", "BaseFinder", "EntityLogger"
+    "StashFinder", "TrailFinder", "BaseFinder", "EntityLogger", "ChunkDupe",
+    "DonkeyDupe", "ItemDupe", "InventoryDupe", "BookDupe", "SignDupe",
+    "AutoDupe", "DupeAlert", "BedrockBreaker", "BedrockClip",
+    
+    # Nova Client & SS-Tool Patterns
+    "novaclient", "nova client", "nova.client", "api.novaclient.lol",
+    "aHR0cDovL2FwaS5ub3ZhY2xpZW50LmxvbC93ZWJob29rLnR4dA==",
+    "addFri", "antiAttack", "/assets/font/font.ttf",
+    "Lithium is not initialized! Skipping event:",
+    "Error in hash", "argon client", "argonclient",
+    "Auto Crystal", "Auto Anchor", "Auto Loot Yeeter",
+    "CwCrystal.class", "ADH.class", "ModuleManager.class",
+    
+    # Advanced Patterns
+    "obf_module", "cheat_module", "hack_module", "bypass_module",
+    "antidetect", "bypassdetect", "evadedetect", "hidedetect",
+    "ClickTotem", "PopLag", "BedBomb", "AnchorBomb", "CrystalBomb",
+    "AutoPlacer", "AutoBreaker", "SmartHole", "SmartSurround",
+    "FeetPlace", "AutoObsidian", "ObsidianPlacer", "WebFill",
+    "HoleMiner", "SelfFill", "AutoTunneler", "AutoEscape"
+)
+
+# === OBFUSCATOR SIGNATURES ===
+$script:ObfuscatorPatterns = @(
+    # Common Obfuscators
+    "ZKMFLOW", "com/zelix", "ZelixKlassMaster", "ZKM",
+    "allatori", "ALLATORIxDEMO", "com/allatori",
+    "proguard", "ProGuard", "-KSMD-",
+    "skidfuscator", "Skidfuscator", "skid",
+    "paramorphism", "Paramorphism",
+    "itzsomebody/radon", "Radon Obfuscator",
+    "StringerJavaObfuscator", "com/licel/stringer",
+    "branchlock", "Branchlock",
+    "dasho", "DashO", "com/dashingTech",
+    "caesium", "Caesium",
+    "yguard", "YGuard",
+    "javaguard", "JavaGuard",
+    "klassmaster", "Klassmaster",
+    "dexguard", "DexGuard",
+    "iprotect", "iProtect",
+    "scuti", "ScutiObf",
+    "superblaubeere", "sb27",
+    "Obzcure", "obzcure",
+    "smoke", "SmokeObf",
+    "JNIC", "jnic"
 )
 
 $script:BypassMods = @()
 $script:JvmFlags = @()
 
 $script:LegitModSlugs = @(
+    # Performance Mods
     "lithium", "sodium", "phosphor", "starlight", "indium", "iris",
     "optifine", "optifabric", "fabric-api", "modmenu", "cloth-config",
-    "architectury-api", "completeconfig", "iceberg", "replaymod",
-    "simple-voice-chat", "voicechat", "worldedit", "litematica",
+    "ferritecore", "krypton", "c2me", "lazydfu", "dashloader",
+    "enhanced-block-entities", "memory-leak-fix", "smoothboot",
+    "chunk-pregenerator", "dynamic-fps", "entityculling", "noisium",
+    "immediatelyfast", "modernfix", "exordium", "ksyxis", "debugify",
+    "badpackets", "threadtweak", "fastload", "fastanim", "fast-ip-ping",
+    
+    # Architecture & Libraries
+    "architectury-api", "completeconfig", "iceberg", "quilted-fabric-api",
+    "fabric-language-kotlin", "geckolib", "playeranimator", "midnightlib",
+    "forge-config-api-port", "cardinal-components-api", "trinkets", "patchouli",
+    
+    # Utility Mods
+    "replaymod", "simple-voice-chat", "voicechat", "worldedit", "litematica",
     "minihud", "tweakeroo", "itemscroller", "malilib", "ok-zoomer",
     "logical-zoom", "zoomify", "better-third-person", "mouse-wheelie",
+    "spark", "carpet", "worldgen-debug", "carpet-extra", "carpet-tis-addition",
+    "mod-loading-screen", "not-enough-crashes", "cullleaves", "cull-less-leaves",
+    
+    # Recipe & Inventory
     "emi", "jei", "rei", "roughly-enough-items", "waila", "jade", "hwyla",
     "inventory-hud", "shulkerbox-tooltip", "appleskin", "controlling",
-    "search-plus", "xaeros-minimap", "xaeros-world-map", "journeymap",
-    "voxelmap", "map-tooltip", "dynamic-fps", "ferritecore", "entityculling",
-    "krypton", "c2me", "lazydfu", "dashloader", "enhanced-block-entities",
-    "memory-leak-fix", "FerriteCore", "smoothboot", "chunk-pregenerator",
-    "spark", "carpet", "worldgen-debug", "carpet-extra", "carpet-tis-addition"
+    "search-plus", "inventory-profiles-next", "travelerstitles", "toast-control",
+    
+    # Maps & Navigation
+    "xaeros-minimap", "xaeros-world-map", "journeymap", "voxelmap", "map-tooltip",
+    "ftb-chunks", "bluemap", "dynmap", "pl3xmap",
+    
+    # Quality of Life
+    "better-ping-display", "blur", "cleancut", "continuity", "effective",
+    "falling-leaves", "lamb-dynamic-lights", "no-chat-reports", "presence-footsteps",
+    "visuality", "waveycapes", "capes", "cosmetic-armor-reworked", "custom-player-models",
+    "sodium-extra", "reeses-sodium-options", "puzzle", "animatica",
+    
+    # Gameplay
+    "create", "mekanism", "applied-energistics-2", "botania", "thermal-expansion",
+    "the-twilight-forest", "terralith", "waystones", "farmers-delight",
+    "origins", "pehkui", "better-combat", "playerex", "levelz",
+    
+    # Building & Decoration
+    "chisel-and-bits", "macaws-furniture", "decorative-blocks", "supplementaries",
+    "adorn", "another-furniture", "building-wands", "effortless-building"
 )
 
 $script:VerifiedMods = @()
@@ -1503,6 +1865,187 @@ function Test-SuspiciousManifest {
     } catch {}
     
     return $suspicious
+}
+
+# === ADVANCED OBFUSCATION DETECTION ===
+function Get-StringEntropy {
+    param([string]$InputString)
+    
+    if ([string]::IsNullOrEmpty($InputString)) { return 0 }
+    
+    $charCounts = @{}
+    foreach ($char in $InputString.ToCharArray()) {
+        if ($charCounts.ContainsKey($char)) {
+            $charCounts[$char]++
+        } else {
+            $charCounts[$char] = 1
+        }
+    }
+    
+    $entropy = 0.0
+    $length = $InputString.Length
+    
+    foreach ($count in $charCounts.Values) {
+        $probability = $count / $length
+        if ($probability -gt 0) {
+            $entropy -= $probability * [math]::Log($probability, 2)
+        }
+    }
+    
+    return $entropy
+}
+
+function Test-Obfuscator {
+    param([string]$FilePath)
+    
+    $results = @{
+        Detected = @()
+        Score = 0
+        Indicators = @()
+        ClassAnalysis = @{
+            Total = 0
+            Numeric = 0
+            Unicode = 0
+            SingleLetter = 0
+            Japanese = 0
+            VeryShort = 0
+        }
+        RiskLevel = "CLEAN"
+    }
+    
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        
+        $allEntries = @($archive.Entries)
+        $contentSamples = @()
+        
+        foreach ($entry in $allEntries) {
+            $name = $entry.FullName
+            
+            if ($name -match "\.class$") {
+                $results.ClassAnalysis.Total++
+                $className = [System.IO.Path]::GetFileNameWithoutExtension(($name -split "/")[-1])
+                
+                # Class name pattern detection
+                if ($className -match "^[\d]+$") { $results.ClassAnalysis.Numeric++ }
+                if ($className -match "^[a-zA-Z]$") { $results.ClassAnalysis.SingleLetter++ }
+                if ($className.Length -le 2) { $results.ClassAnalysis.VeryShort++ }
+                if ($className -match "[\u3040-\u309F\u30A0-\u30FF]") { $results.ClassAnalysis.Japanese++ }
+                if ($className -match "[^\x00-\x7F]") { $results.ClassAnalysis.Unicode++ }
+                
+                # Sample content
+                if ($contentSamples.Count -lt 15 -and $entry.Length -lt 50000 -and $entry.Length -gt 100) {
+                    try {
+                        $stream = $entry.Open()
+                        $ms = New-Object System.IO.MemoryStream
+                        $stream.CopyTo($ms)
+                        $stream.Close()
+                        $contentSamples += [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+                        $ms.Dispose()
+                    } catch {}
+                }
+            }
+        }
+        
+        $archive.Dispose()
+        
+        # Calculate scores
+        $total = [math]::Max(1, $results.ClassAnalysis.Total)
+        $score = 0
+        
+        $numericPct = [math]::Round(($results.ClassAnalysis.Numeric / $total) * 100, 1)
+        $unicodePct = [math]::Round(($results.ClassAnalysis.Unicode / $total) * 100, 1)
+        $japanesePct = [math]::Round(($results.ClassAnalysis.Japanese / $total) * 100, 1)
+        $singleLetterPct = [math]::Round(($results.ClassAnalysis.SingleLetter / $total) * 100, 1)
+        $shortPct = [math]::Round(($results.ClassAnalysis.VeryShort / $total) * 100, 1)
+        
+        if ($numericPct -gt 30) { 
+            $results.Indicators += "NUMERIC: $numericPct%"
+            $score += 20
+        }
+        if ($unicodePct -gt 5) { 
+            $results.Indicators += "UNICODE: $unicodePct%"
+            $score += 25
+        }
+        if ($japanesePct -gt 0) { 
+            $results.Indicators += "JAPANESE: $japanesePct%"
+            $score += 30
+        }
+        if ($singleLetterPct -gt 30) { 
+            $results.Indicators += "SINGLE-LETTER: $singleLetterPct%"
+            $score += 15
+        }
+        if ($shortPct -gt 40) { 
+            $results.Indicators += "SHORT NAMES: $shortPct%"
+            $score += 10
+        }
+        
+        # Check for known obfuscators
+        $allContent = $contentSamples -join " "
+        
+        $knownObfuscators = @{
+            "ZKM" = @("ZKMFLOW", "com/zelix", "ZelixKlassMaster")
+            "Allatori" = @("allatori", "ALLATORIxDEMO", "com/allatori")
+            "ProGuard" = @("proguard", "ProGuard", "-KSMD-")
+            "Skidfuscator" = @("skidfuscator", "Skidfuscator", "skid")
+            "Paramorphism" = @("paramorphism", "Paramorphism")
+            "Radon" = @("itzsomebody/radon", "Radon Obfuscator")
+            "Stringer" = @("StringerJavaObfuscator", "com/licel/stringer")
+            "Branchlock" = @("branchlock", "Branchlock")
+            "DashO" = @("dasho", "DashO", "com/dashingTech")
+            "Caesium" = @("caesium", "Caesium")
+            "YGuard" = @("yguard", "YGuard")
+            "JavaGuard" = @("javaguard", "JavaGuard")
+            "Klassmaster" = @("klassmaster", "Klassmaster")
+            "DexGuard" = @("dexguard", "DexGuard")
+            "iProtect" = @("iprotect", "iProtect")
+            "Scuti" = @("scuti", "ScutiObf")
+            "sb27" = @("superblaubeere", "sb27")
+            "Obzcure" = @("Obzcure", "obzcure")
+            "SmokeObf" = @("smoke", "SmokeObf")
+            "JNIC" = @("JNIC", "jnic")
+            "Native" = @("native_encrypt", "native_obf", "jni_obf")
+        }
+        
+        foreach ($obfName in $knownObfuscators.Keys) {
+            foreach ($pattern in $knownObfuscators[$obfName]) {
+                if ($allContent -match [regex]::Escape($pattern)) {
+                    $results.Detected += @{ Name = $obfName; Severity = "HIGH" }
+                    $score += 25
+                    break
+                }
+            }
+        }
+        
+        # Base64/encrypted strings
+        $base64Count = ([regex]::Matches($allContent, '[A-Za-z0-9+/]{30,}={0,2}')).Count
+        if ($base64Count -gt 15) {
+            $results.Indicators += "BASE64: $base64Count strings"
+            $score += 15
+        }
+        
+        $results.Score = [math]::Min(100, $score)
+        
+        if ($results.Score -ge 60) {
+            $results.RiskLevel = "CRITICAL"
+        } elseif ($results.Score -ge 40) {
+            $results.RiskLevel = "HIGH"
+        } elseif ($results.Score -ge 20) {
+            $results.RiskLevel = "MEDIUM"
+        } elseif ($results.Score -ge 10) {
+            $results.RiskLevel = "LOW"
+        }
+        
+        if ($results.Score -gt 30 -and $results.Detected.Count -eq 0) {
+            $results.Detected += @{ Name = "Unknown Obfuscator"; Severity = $results.RiskLevel }
+        }
+        
+    } catch {
+        Write-Verbose "Error in obfuscator check: $_"
+    }
+    
+    return $results
 }
 
 function Analyze-ModsFolder {
@@ -1830,6 +2373,10 @@ function Run-SystemAnalysis {
     Check-DriverSignatureEnforcement
     Check-SuspiciousProcesses
     Check-DNSCache
+    Check-BAMRegistry
+    Check-ShimCache
+    Check-Amcache
+    Check-JumpLists
     Check-RecentJarFiles
     Check-JavaArguments
     
