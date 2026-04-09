@@ -7,7 +7,7 @@ param(
 )
 
 $script:Config = @{
-    Version = "4.2.0"
+    Version = "4.3.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
@@ -16,7 +16,7 @@ $script:Config = @{
     CheatSignatures = "600+"
     SystemChecks = "40+"
     Obfuscators = "20+"
-    ObfuscationPatterns = "15+"
+    ObfuscationPatterns = "19+"
     Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods"
 }
 
@@ -35,13 +35,6 @@ function Write-Banner {
     Clear-Host
     $banner = @"
 
-    ##    ## ##     ## ##     ## #### ##    ##  #######  
-     ##  ##  ##     ## ###   ###  ##  ##   ## ##     ## 
-      ####   ##     ## #### ####  ##  ##  ##  ##     ## 
-       ##    ##     ## ## ### ##  ##  #####   ##     ## 
-       ##    ##     ## ##     ##  ##  ##  ##  ##     ## 
-       ##    ##     ## ##     ##  ##  ##   ## ##     ## 
-       ##     #######  ##     ## #### ##    ##  #######  
                M O D   A N A L Y Z E R   v$($script:Config.Version)
 "@
     Write-Host $banner -ForegroundColor $script:Colors.Primary
@@ -133,10 +126,6 @@ function Test-AdminPrivileges {
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-
-# ============================================================================
-# SYSTEM ANALYSIS FUNCTIONS
-# ============================================================================
 
 function Check-HostsFileManipulation {
     Write-Section "Hosts File Analysis" "NET"
@@ -963,7 +952,6 @@ function Check-AdvancedJVMArgs {
     
     $found = $false
     
-    # Third-party launchers
     $launcherPaths = @(
         "$env:APPDATA\PrismLauncher\instances",
         "$env:APPDATA\MultiMC\instances",
@@ -1016,7 +1004,6 @@ function Check-AdvancedJVMArgs {
         } catch {}
     }
     
-    # Check JVM environment variables
     $envVars = @("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS")
     foreach ($var in $envVars) {
         $envValue = [Environment]::GetEnvironmentVariable($var, "User")
@@ -1038,10 +1025,6 @@ function Check-AdvancedJVMArgs {
         Write-Result "CLEAN" "No suspicious advanced JVM configurations"
     }
 }
-
-# ============================================================================
-# DOOMSDAY DETECTION MODULE
-# ============================================================================
 
 function Check-JavaProcessMemory {
     Write-Section "Java Process Memory Analysis" "MEM"
@@ -1203,10 +1186,6 @@ function Check-DoomsdayRegistry {
     }
 }
 
-# ============================================================================
-# FABRIC/FORGE JVM INJECTION SCANNER (from YarpsModAnalyzer)
-# ============================================================================
-
 function Check-FabricForgeInjection {
     Write-Section "Fabric/Forge JVM Injection Scanner" "INJ"
     
@@ -1223,7 +1202,6 @@ function Check-FabricForgeInjection {
     Write-Result "INFO" "Scanning $($javaProcesses.Count) Java process(es)..."
     
     $fabricPatterns = @{
-        # Fabric Injection
         "fabric.addMods" = '-Dfabric\.addMods='
         "fabric.loadMods" = '-Dfabric\.loadMods='
         "fabric.classPathGroups" = '-Dfabric\.classPathGroups='
@@ -1231,23 +1209,18 @@ function Check-FabricForgeInjection {
         "fabric.remapClasspathFile" = '-Dfabric\.remapClasspathFile='
         "fabric.mixin.configs" = '-Dfabric\.mixin\.configs='
         "fabric.customModList" = '-Dfabric\.customModList='
-        # Forge Injection
         "forge.addMods" = '-Dforge\.addMods='
         "forge.mods" = '-Dforge\.mods='
         "fml.coreMods.load" = '-Dfml\.coreMods\.load='
         "forge.coreMods.dir" = '-Dforge\.coreMods\.dir='
         "forge.modDir" = '-Dforge\.modDir='
         "fml.customModList" = '-Dfml\.customModList='
-        # Security Bypass
         "javaSecurityManager" = '-Djava\.security\.manager='
         "javaSecurityPolicy" = '-Djava\.security\.policy='
-        # Classpath Manipulation
         "bootClasspath" = '-Xbootclasspath'
         "systemClassLoader" = '-Djava\.system\.class\.loader='
         "javaClassPath" = '-Djava\.class\.path='
-        # Cheat Client Signatures
         "cheatClientBrand" = '-D(client|launcher)\.brand=(Wurst|Aristois|Impact|Kilo|Future|Lambda|Rusher|Konas|Phobos|Salhack|ForgeHax|Mathax|Meteor|Async|Seppuku|Xatz|Wolfram|Huzuni|Jigsaw|Zamorozka|Moon|Rage|Exhibition|Virtue|Novoline|Rekt|Skid|Ares|Abyss|Thunder|Tenacity|Rise|Flux|Gamesense|Intent|Remix|Sight|Vape|Shield|Ghost|Crispy|Inertia)'
-        # Cheat Mod Patterns
         "cheatPattern" = '-D(xray|fly|speed|killaura|reach|esp|wallhack|noclip|autoclick|aimbot|triggerbot|antiknockback|nofall|timer|step|fullbright|nightvision|cavefinder)\.'
     }
     
@@ -1268,7 +1241,6 @@ function Check-FabricForgeInjection {
                 foreach ($patternName in $fabricPatterns.Keys) {
                     $regexPattern = $fabricPatterns[$patternName]
                     if ($commandLine -match $regexPattern) {
-                        # Skip legitimate Java module opens
                         if ($patternName -eq "addOpens" -or $patternName -eq "addExports") {
                             continue
                         }
@@ -1277,7 +1249,6 @@ function Check-FabricForgeInjection {
                     }
                 }
                 
-                # Check for cheat client names
                 foreach ($cheatClient in $cheatClients) {
                     if ($commandLine -match "(?i)\b$cheatClient\b") {
                         if ("CheatClient-$cheatClient" -notin $detectedPatterns) {
@@ -1287,7 +1258,6 @@ function Check-FabricForgeInjection {
                     }
                 }
                 
-                # Check for encoded injection
                 if ($commandLine -match '(%3B|%26%26|%7C%7C|%7C|%60|%24|%3C|%3E)') {
                     $detectedPatterns += "EncodedInjection"
                     $found = $true
@@ -1315,13 +1285,7 @@ function Check-FabricForgeInjection {
     }
 }
 
-
-# ============================================================================
-# CHEAT SIGNATURES (600+)
-# ============================================================================
-
 $script:CheatStrings = @(
-    # Combat
     "KillAura", "ClickAura", "TriggerBot", "MultiAura", "ForceField", "LegitAura", "TPAura", "SwitchAura",
     "AimAssist", "AimBot", "AutoAim", "SilentAim", "AimLock", "AimCorrect", "SmoothAim", "TargetAim", "LockOn", "HeadSnap",
     "CrystalAura", "AutoCrystal", "AutoHitCrystal", "CrystalOptimize", "CrystalPvP", "CrystalPlace", "dontPlaceCrystal", "dontBreakCrystal", "canPlaceCrystalServer", "autoCrystalPlaceClock",
@@ -1335,7 +1299,6 @@ $script:CheatStrings = @(
     "AutoWeapon", "AutoSword", "AutoCity", "Burrow", "SelfTrap", "Surround", "HoleFiller", "AutoWeb", "AntiSurround", "AntiBurrow",
     "W-Tap", "WTap", "AutoW", "Combo", "TargetStrafe", "AutoGap", "AutoPearl", "PearlPredict", "AutoEagle", "BackTrack", "ShieldBreaker", "ShieldDisabler", "JumpReset", "SprintReset", "AxeSpam", "MaceSwap", "StunSlam", "Donut",
     
-    # Movement
     "FlyHack", "CreativeFlight", "BoatFly", "Jetpack", "GlitchFly", "VanillaFly", "PacketFly", "AirJump", "InfiniteFly",
     "SpeedHack", "BHop", "BunnyHop", "Strafe", "SpeedMine", "FastWalk", "SprintBypass", "TimerSpeed", "GroundSpeed",
     "NoFall", "AntiFall", "NoFallDamage", "SafeFall",
@@ -1346,13 +1309,11 @@ $script:CheatStrings = @(
     "SpiderHack", "WallClimb", "ClimbWalls",
     "GlideHack", "ExtraElytra", "ElytraFly", "ElytraSwap", "ElytraBoost", "ElytraSpeed", "InstantElytra", "ElytraReplace",
     
-    # Building/World
     "Scaffold", "ScaffoldWalk", "FastBridge", "BuildHelper", "AutoBridge", "BlockFly", "AirBridge", "TowerAssist",
     "Nuker", "NukerLegit", "FastBreak", "InstantBreak", "AutoMine", "SpeedMine", "InstaMine", "BlockBreaker", "MassBreak",
     "GhostHand", "GhostBlock", "GhostPick", "NoSwing",
     "FastPlace", "PlaceAssist", "AirPlace", "AutoPlace", "InstantPlace", "SpeedPlace",
     
-    # Visual/ESP
     "PlayerESP", "MobESP", "ItemESP", "StorageESP", "ChestESP", "BlockESP", "EntityESP", "BoxESP", "HealthESP", "ArmorESP",
     "Tracers", "NameTagsHack", "Chams", "MobSpawnESP", "HandESP", "HitColor",
     "XRayHack", "OreFinder", "CaveFinder", "OreESP", "XrayMod", "BlockHighlight",
@@ -1361,31 +1322,26 @@ $script:CheatStrings = @(
     "NewChunks", "ChunkBorders", "TunnelFinder", "ChunkAnalyzer", "LoadedChunks", "ChunkTracer",
     "TargetHUD", "CPSDisplay", "ReachDisplay", "HitParticles", "TotemHit", "ArrayDisplay", "WaterMark", "ModuleList",
     
-    # Player
     "AutoClicker", "DoubleClicker", "JitterClick", "ButterflyClick", "AutoLeftClick", "AutoRightClick", "ClickSpam", "CPSBoost",
     "AutoArmor", "ChestStealer", "InvManager", "InventoryManager", "ChestSteal", "InvMovebypass", "InventoryCleaner", "AutoSort", "InvWalk",
     "AutoPot", "AutoPotion", "AutoEat", "AutoSprint", "FastXP", "FastExp", "AntiAFK", "AutoRespawn", "DeathCoords", "PotionSaver", "AutoFirework", "SafeWalk", "AntiHunger", "NoJumpDelay",
     "FakePlayer", "Blink", "NoRotation", "SilentRotation", "FakeInv", "FakeLag", "FakeNick", "FakeItem", "PopSwitch", "PingSpoof", "FakeLatency", "FakePing", "PackSpoof", "SpoofRotation", "PositionSpoof",
     "TimerHack", "GameSpeed", "SpeedTimer", "SlowTimer",
     
-    # Exploit/Bypass
     "Disabler", "GrimBypass", "VulcanBypass", "MatrixBypass", "AACBypass", "VerusDisabler", "IntaveBypass", "WatchdogBypass", "SpartanBypass", "KarhuBypass", "PolarBypass",
     "PacketFly", "PacketMine", "PacketWalk", "PacketSneak", "PacketCancel", "PacketDupe", "InvalidPacket", "PacketSpam",
     "ServerCrasher", "ChatSpam", "BookBot", "ChunkBan", "ItemBan", "NBTExploit", "CreativeExploit", "OpExploit", "ConsoleSpam",
     "PearlClip", "BoatClip", "EntityClip", "MinecartClip", "HorseClip", "VehicleClip",
     "AntiVanish", "StaffAlert", "PortalGui", "EntityControl", "AutoMount", "AuthBypass", "LicenseCheckMixin", "obfuscatedAuth", "ItemExploit", "Exploits", "SilentClose",
     
-    # Automation
     "AutoFarm", "AutoFish", "Baritone", "PathFinder", "AutoWalk", "AutoMiner", "AutoFarmer", "CropAura", "AutoHarvest", "TreeAura", "AutoBreed",
     "AutoBuild", "InstaBuild", "BuildRandom", "TemplateTool", "AutoSign", "Printer", "SchematicaPrinter", "LitematicaPrinter",
     "AutoHighway", "HighwayBuilder", "ElytraHighway", "HighwayTools", "AutoDigger", "TunnelBot",
     "AutoDisconnect", "AutoReconnect", "AutoCommand", "MacroSystem", "AutoTPA", "AutoQueue", "AutoLogin",
     
-    # Client UI/System
     "ClickGUI", "TabGUI", "HUDEditor", "ModuleManager", "ConfigManager", "ThemeManager", "KeybindManager",
     "SelfDestruct", "Panic", "HideClient", "ClientHider", "ScreenshotProtection", "StreamerMode", "StaffMode",
     
-    # Known Cheat Clients
     "vape.gg", "vape v4", "vapeclient", "vapeV4", "vapeV3", "vapeLite", "vape lite", "manthe.dev",
     "rise6", "riseClient", "rise.today", "riseclient.com", "intent.store",
     "meteor-client", "meteorclient", "meteordev", "meteordevelopment.orbit", "meteordevelopment.meteorclient", "meteoraddon",
@@ -1398,48 +1354,35 @@ $script:CheatStrings = @(
     "novaclient", "nova client", "api.novaclient.lol",
     "WalksyOptimizer", "WalskyOptimizer", "WalksyCrystalOptimizerMod", "LWFH Crystal",
     
-    # Nova Client (SS-Tool patterns)
     "aHR0cDovL2FwaS5ub3ZhY2xpZW50LmxvbC93ZWJob29rLnR4dA==", "addFri", "antiAttack",
     "/assets/font/font.ttf", "Lithium is not initialized! Skipping event:", "Error in hash",
     
-    # Mixin Hooks
     "setBlockBreakingCooldown", "getBlockBreakingCooldown", "blockBreakingCooldown", "invokeDoAttack", "invokeDoItemUse", "onAttackEntity", "attackCooldown",
     "onTickMovement", "onPushOutOfBlocks", "onIsGlowing", "onMove", "setVelocity", "jumpMovementFactor", "moveEntityWithHeading",
     "onMouseButton", "ClientPlayerInteractionManagerAccessor", "ClientPlayerEntityMixin", "WorldRendererMixin", "GameRendererMixin", "InGameHudMixin",
     
-    # Package Paths
     "net/wurstclient", "meteordevelopment", "cc/novoline", "com/alan/clients", "club/maxstats", "wtf/moonlight", "me/zeroeightsix/kami", "net/ccbluex", "today/opai", "net/minecraft/injection", "org/chainlibs/module/impl/modules", "xyz/greaj", "com/cheatbreaker", "com/moonsworth",
     
-    # Japanese Unicode Obfuscation
     "?.class", "??.class", "?.class", "??.class", "??.class", "?.class", "?.class", "?.class", "?.class", "??.class",
     
-    # Fullwidth Unicode
     "AutoCrystal", "Auto Crystal", "AutoHitCrystal", "AutoAnchor", "Auto Anchor",
     "AutoTotem", "AimAssist", "TriggerBot", "FakeLag", "Freecam",
     
-    # Injection
     "-javaagent:", "agentmain", "premain", "Instrumentation", "ClassFileTransformer", "redefineClasses", "retransformClasses",
     "System.loadLibrary", "System.load", "Runtime.load", "JNI_OnLoad",
     "Unsafe.getUnsafe", "sun.misc.Unsafe", "putInt", "putLong", "allocateMemory", "freeMemory", "copyMemory",
     "defineClass", "URLClassLoader", "SecureClassLoader", "loadClass", "findClass",
     
-    # Malicious
     "SessionStealer", "CookieStealer", "Ratted", "TokenLogger", "TokenGrabber", "CredentialStealer", "DiscordToken", "SessionToken", "MinecraftToken", "BrowserStealer", "PasswordStealer",
     "RemoteAccess", "ReverseShell", "C2Server", "CommandControl", "BotNet", "Backdoor", "TrojanHorse", "KeyLogger",
     
-    # Special Mods
     "KeyPearl", "LootYeeter", "AutoBreach", "HideCommands", "NoCommandBlock", "AntiFabricSequence", "AntiPacketKick", "NoServerCheck", "FakeWorld",
     "StashFinder", "TrailFinder", "BaseFinder", "EntityLogger", "CoordExploit", "MapDownloader", "ChunkLogger", "NewerNewChunks",
     
-    # Libraries
     "imgui.gl3", "imgui.glfw", "imgui-java", "imgui.binding",
     "jnativehook", "JNativeHook", "GlobalScreen", "NativeKeyListener", "NativeMouseListener",
     "phantom-refmap.json", "client-refmap.json", "cheat-refmap.json"
 )
-
-# ============================================================================
-# DISALLOWED MODS (from YarpsModAnalyzer)
-# ============================================================================
 
 $script:DisallowedMods = @{
     "xeros-minimap" = @{ Names = @("Xero's Minimap", "Xeros Minimap", "xeros-minimap", "XerosMinimap") }
@@ -1450,10 +1393,6 @@ $script:DisallowedMods = @{
     "itemscroller" = @{ Names = @("Item Scroller", "itemscroller", "ItemScroller") }
     "tweakeroo" = @{ Names = @("Tweakeroo", "tweakeroo", "Tweakeroo") }
 }
-
-# ============================================================================
-# OBFUSCATOR DETECTION (35+)
-# ============================================================================
 
 function Get-StringEntropy {
     param([string]$InputString)
@@ -1505,6 +1444,10 @@ function Test-Obfuscator {
             HashLike = 0
             ConfusionChars = 0
             DummyClasses = 0
+            GibberishNames = 0
+            NoVowelNames = 0
+            ConsonantCluster = 0
+            FullwidthChars = 0
         }
         PackageAnalysis = @{
             RandomPaths = 0
@@ -1540,43 +1483,39 @@ function Test-Obfuscator {
                     $results.PackageAnalysis.TotalPaths++
                 }
                 
-                # === NUMERIC ONLY (z.B. "12345.class") ===
                 if ($className -match "^[\d]+$") { 
                     $results.ClassAnalysis.Numeric++ 
                 }
                 
-                # === SINGLE LETTER (z.B. "a.class", "Z.class") ===
                 if ($className -match "^[a-zA-Z]$") { 
                     $results.ClassAnalysis.SingleLetter++ 
                 }
                 
-                # === TWO LETTERS (z.B. "aa.class", "ab.class", "zz.class") ===
                 if ($className -match "^[a-zA-Z]{2}$") { 
                     $results.ClassAnalysis.TwoLetter++ 
                 }
                 
-                # === VERY SHORT (1-3 chars, nicht numerisch) ===
                 if ($className.Length -le 3 -and $className -notmatch "^\d+$") { 
                     $results.ClassAnalysis.VeryShort++ 
                 }
                 
-                # === JAPANESE UNICODE ===
                 if ($className -match "[\u3040-\u309F\u30A0-\u30FF]") { 
                     $results.ClassAnalysis.Japanese++ 
                 }
                 
-                # === CHINESE UNICODE ===
                 if ($className -match "[\u4E00-\u9FFF]") { 
                     $results.ClassAnalysis.Chinese++ 
                 }
                 
-                # === ANY NON-ASCII UNICODE ===
                 if ($className -match "[^\x00-\x7F]") { 
                     $results.ClassAnalysis.Unicode++ 
                 }
                 
-                # === ALPHANUMERIC MIX (z.B. "C8394k", "a8x3z", "X1Y2Z3") ===
-                # Typisches Obfuscation-Muster: Buchstaben und Zahlen gemischt
+                # Fullwidth Unicode character detection (ａ-ｚ, Ａ-Ｚ, ０-９)
+                if ($className -match "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]") {
+                    $results.ClassAnalysis.FullwidthChars++
+                }
+                
                 if ($className -match "^[a-zA-Z]+\d+[a-zA-Z0-9]*$" -or 
                     $className -match "^[a-zA-Z]\d[a-zA-Z0-9]+$" -or
                     $className -match "^\d+[a-zA-Z]+\d*$" -or
@@ -1584,14 +1523,11 @@ function Test-Obfuscator {
                     $results.ClassAnalysis.AlphaNumMix++
                 }
                 
-                # === HASH-LIKE NAMES (z.B. "a8f3c2d1", "ABCD1234") ===
                 if ($className -match "^[a-fA-F0-9]{6,}$" -or
                     $className -match "^[A-Z]{2,4}[0-9]{4,}$") {
                     $results.ClassAnalysis.HashLike++
                 }
                 
-                # === CONFUSION CHARS (Il1O0 patterns) ===
-                # Verwendet nur Zeichen die leicht verwechselt werden
                 if ($className -match "^[Il1O0]+$" -or 
                     $className -match "^[_]+$" -or 
                     $className -match "^\$+\d*$" -or
@@ -1599,7 +1535,6 @@ function Test-Obfuscator {
                     $results.ClassAnalysis.ConfusionChars++
                 }
                 
-                # === RANDOM LOWERCASE PATTERN ===
                 if ($className -match "^[a-z]{5,}$" -and $className -notmatch "(client|module|config|util|helper|manager|handler|mixin|accessor|event|render|player|entity|world|block|item|gui|screen|network|packet)") {
                     $uniqueChars = ($className.ToCharArray() | Sort-Object -Unique).Count
                     $entropy = $uniqueChars / $className.Length
@@ -1608,16 +1543,56 @@ function Test-Obfuscator {
                     }
                 }
                 
-                # === SUSPICIOUS PATTERNS ===
-                if ($className -match "^[a-zA-Z]\d$" -or           # a1, B2, etc.
-                    $className -match "^class\d+$" -or             # class1, class2
-                    $className -match "^[A-Z]{1,2}\d{1,2}$" -or    # A1, AB12
-                    $className -match "^func\d+$" -or              # func1, func2
-                    $className -match "^[a-z]{1,2}\d{1,3}$") {     # a1, ab123
+                if ($className -match "^[a-zA-Z]\d$" -or
+                    $className -match "^class\d+$" -or
+                    $className -match "^[A-Z]{1,2}\d{1,2}$" -or
+                    $className -match "^func\d+$" -or
+                    $className -match "^[a-z]{1,2}\d{1,3}$") {
                     $results.ClassAnalysis.Suspicious++
                 }
                 
-                # Sample class content for signature detection
+                if ($className -match "^[a-z]{3,8}$") {
+                    $vowels = ($className.ToCharArray() | Where-Object { $_ -match "[aeiou]" }).Count
+                    $consonants = $className.Length - $vowels
+                    $vowelRatio = $vowels / $className.Length
+                    
+                    $hasConsonantCluster = $className -match "[bcdfghjklmnpqrstvwxyz]{3,}"
+                    
+                    $hasRareCombos = $className -match "(xq|qx|zx|xz|vw|wv|jq|qj|qz|zq|vx|xv|bx|xb|kq|qk|wx|jx|zv|vz|qw|wq)"
+                    
+                    if ($vowelRatio -lt 0.2) {
+                        $results.ClassAnalysis.NoVowelNames++
+                    }
+                    
+                    if ($hasConsonantCluster) {
+                        $results.ClassAnalysis.ConsonantCluster++
+                    }
+                    
+                    if (($hasRareCombos -or $hasConsonantCluster) -and $vowelRatio -lt 0.4) {
+                        $results.ClassAnalysis.GibberishNames++
+                    }
+                    
+                    if ($className.Length -le 5 -and $vowels -eq 0) {
+                        $results.ClassAnalysis.GibberishNames++
+                    }
+                }
+                
+                if ($className -match "^[A-Z]{3,6}$" -and $className -notmatch "(HTTP|JSON|XML|HTML|API|GUI|URL|URI|SQL|TCP|UDP|JVM|JAR|ZIP)") {
+                    $vowels = ($className.ToCharArray() | Where-Object { $_ -match "[AEIOU]" }).Count
+                    if ($vowels -eq 0 -or ($vowels / $className.Length) -lt 0.2) {
+                        $results.ClassAnalysis.GibberishNames++
+                    }
+                }
+                
+                if ($className -match "^[a-zA-Z]{3,6}$" -and $className -cmatch "[a-z]" -and $className -cmatch "[A-Z]") {
+                    if ($className -cmatch "^[a-z][A-Z]" -or $className -cmatch "[A-Z][a-z][A-Z]") {
+                        $vowels = ($className.ToLower().ToCharArray() | Where-Object { $_ -match "[aeiou]" }).Count
+                        if ($vowels -le 1) {
+                            $results.ClassAnalysis.GibberishNames++
+                        }
+                    }
+                }
+                
                 if ($contentSamples.Count -lt 50 -and $entry.Length -lt 100000 -and $entry.Length -gt 100) {
                     try {
                         $stream = $entry.Open()
@@ -1633,19 +1608,14 @@ function Test-Obfuscator {
             }
         }
         
-        # === DUMMY CLASS DETECTION ===
-        # Classes under 200 bytes are likely dummy/empty
         $smallClasses = ($classSizes | Where-Object { $_ -lt 200 }).Count
         $results.ClassAnalysis.DummyClasses = $smallClasses
         
-        # === SEQUENTIAL NAMING DETECTION ===
-        # Check for patterns like a,b,c,d or aa,ab,ac,ad
         $sortedNames = $classNames | Sort-Object
         $sequentialCount = 0
         for ($i = 1; $i -lt $sortedNames.Count; $i++) {
             $prev = $sortedNames[$i-1]
             $curr = $sortedNames[$i]
-            # Check if names are sequential (a->b, aa->ab, etc.)
             if ($prev.Length -eq $curr.Length -and $prev.Length -le 3) {
                 $prevLast = [int][char]$prev[-1]
                 $currLast = [int][char]$curr[-1]
@@ -1656,16 +1626,13 @@ function Test-Obfuscator {
         }
         $results.ClassAnalysis.Sequential = $sequentialCount
         
-        # === PACKAGE PATH ANALYSIS ===
         $uniquePackages = $packagePaths | Sort-Object -Unique
         foreach ($pkg in $uniquePackages) {
             $parts = $pkg -split "/"
             foreach ($part in $parts) {
-                # Single char package parts (wie a/b/c/ClassName)
                 if ($part -match "^[a-zA-Z]$") {
                     $results.PackageAnalysis.SingleCharPaths++
                 }
-                # Random-looking package names
                 if ($part -match "^[a-z]{1,2}\d+$" -or $part -match "^[a-zA-Z]\d[a-zA-Z0-9]+$") {
                     $results.PackageAnalysis.RandomPaths++
                 }
@@ -1674,7 +1641,6 @@ function Test-Obfuscator {
         
         $archive.Dispose()
         
-        # === SCORE CALCULATION ===
         $total = [math]::Max(1, $results.ClassAnalysis.Total)
         
         $numericPct = [math]::Round(($results.ClassAnalysis.Numeric / $total) * 100, 1)
@@ -1689,82 +1655,93 @@ function Test-Obfuscator {
         $dummyPct = [math]::Round(($results.ClassAnalysis.DummyClasses / $total) * 100, 1)
         $sequentialPct = [math]::Round(($results.ClassAnalysis.Sequential / $total) * 100, 1)
         $suspiciousPct = [math]::Round(($results.ClassAnalysis.Suspicious / $total) * 100, 1)
+        $gibberishPct = [math]::Round(($results.ClassAnalysis.GibberishNames / $total) * 100, 1)
+        $noVowelPct = [math]::Round(($results.ClassAnalysis.NoVowelNames / $total) * 100, 1)
+        $consonantClusterPct = [math]::Round(($results.ClassAnalysis.ConsonantCluster / $total) * 100, 1)
+        $fullwidthPct = [math]::Round(($results.ClassAnalysis.FullwidthChars / $total) * 100, 1)
         
         $score = 0
         
-        # Numeric class names (12345.class)
         if ($numericPct -gt 20) { 
             $results.Indicators += "NUMERIC CLASSES: $numericPct% ($($results.ClassAnalysis.Numeric) files)"
             $score += [math]::Min(25, $numericPct * 0.8)
         }
         
-        # Unicode/Non-ASCII
         if ($unicodePct -gt 3) { 
             $results.Indicators += "UNICODE CLASSES: $unicodePct%"
             $score += [math]::Min(30, $unicodePct * 3)
         }
         
-        # Japanese obfuscation (sehr verdächtig)
         if ($japanesePct -gt 0) { 
             $results.Indicators += "JAPANESE OBFUSCATION: $japanesePct% ($($results.ClassAnalysis.Japanese) classes)"
             $score += [math]::Min(40, $japanesePct * 4 + 20)
         }
         
-        # Single letter classes (a.class, b.class)
         if ($singleLetterPct -gt 15) { 
             $results.Indicators += "SINGLE-LETTER CLASSES: $singleLetterPct% ($($results.ClassAnalysis.SingleLetter) files)"
             $score += [math]::Min(25, $singleLetterPct * 0.8)
         }
         
-        # Two letter classes (aa.class, ab.class)
         if ($twoLetterPct -gt 20) { 
             $results.Indicators += "TWO-LETTER CLASSES: $twoLetterPct% ($($results.ClassAnalysis.TwoLetter) files)"
             $score += [math]::Min(20, $twoLetterPct * 0.6)
         }
         
-        # Very short names (1-3 chars)
         if ($shortPct -gt 30) { 
             $results.Indicators += "SHORT CLASS NAMES: $shortPct%"
             $score += [math]::Min(20, $shortPct * 0.4)
         }
         
-        # Alphanumeric mix (C8394k, a8x3z) - SEHR verdächtig
         if ($alphaNumPct -gt 10) { 
             $results.Indicators += "ALPHANUMERIC MIX: $alphaNumPct% ($($results.ClassAnalysis.AlphaNumMix) files like 'C8394k')"
             $score += [math]::Min(35, $alphaNumPct * 2)
         }
         
-        # Hash-like names
         if ($hashLikePct -gt 5) { 
             $results.Indicators += "HASH-LIKE NAMES: $hashLikePct%"
             $score += [math]::Min(20, $hashLikePct * 2)
         }
         
-        # Confusion characters (Il1O0)
         if ($confusionPct -gt 3) { 
             $results.Indicators += "CONFUSION CHARS (Il1O0): $confusionPct%"
             $score += [math]::Min(30, $confusionPct * 5)
         }
         
-        # Dummy/empty classes
         if ($dummyPct -gt 25) { 
             $results.Indicators += "DUMMY CLASSES (<200B): $dummyPct% ($($results.ClassAnalysis.DummyClasses) files)"
             $score += [math]::Min(20, $dummyPct * 0.5)
         }
         
-        # Sequential naming (a,b,c,d)
         if ($sequentialPct -gt 10) { 
             $results.Indicators += "SEQUENTIAL NAMING: $sequentialPct% (a->b->c pattern)"
             $score += [math]::Min(25, $sequentialPct * 1.5)
         }
         
-        # General suspicious patterns
         if ($suspiciousPct -gt 15) { 
             $results.Indicators += "SUSPICIOUS PATTERNS: $suspiciousPct%"
             $score += [math]::Min(20, $suspiciousPct * 0.8)
         }
         
-        # Package path analysis
+        if ($gibberishPct -gt 5) {
+            $results.Indicators += "GIBBERISH NAMES: $gibberishPct% ($($results.ClassAnalysis.GibberishNames) files like 'ruwj', 'xkqp')"
+            $score += [math]::Min(40, $gibberishPct * 3)
+        }
+        
+        if ($noVowelPct -gt 8) {
+            $results.Indicators += "NO-VOWEL NAMES: $noVowelPct% ($($results.ClassAnalysis.NoVowelNames) files without vowels)"
+            $score += [math]::Min(30, $noVowelPct * 2)
+        }
+        
+        if ($consonantClusterPct -gt 10) {
+            $results.Indicators += "CONSONANT CLUSTERS: $consonantClusterPct% ($($results.ClassAnalysis.ConsonantCluster) files with 'bcdfg' patterns)"
+            $score += [math]::Min(25, $consonantClusterPct * 1.5)
+        }
+        
+        if ($fullwidthPct -gt 0 -or $results.ClassAnalysis.FullwidthChars -gt 0) {
+            $results.Indicators += "FULLWIDTH UNICODE CHARS: $fullwidthPct% ($($results.ClassAnalysis.FullwidthChars) files with ａｂｃ/ＡＢＣ/０１２ chars)"
+            $score += [math]::Min(50, 30 + ($results.ClassAnalysis.FullwidthChars * 5))
+        }
+        
         if ($results.PackageAnalysis.SingleCharPaths -gt 5) {
             $results.Indicators += "SINGLE-CHAR PACKAGES: $($results.PackageAnalysis.SingleCharPaths) (a/b/c paths)"
             $score += [math]::Min(15, $results.PackageAnalysis.SingleCharPaths * 2)
@@ -1774,10 +1751,27 @@ function Test-Obfuscator {
             $score += [math]::Min(15, $results.PackageAnalysis.RandomPaths * 3)
         }
         
-        # Known obfuscator signatures
         $allContent = $contentSamples -join " "
         
-        # Cheat-spezifische Obfuscatoren (KRITISCH)
+        # Fullwidth Unicode character detection in content (ａ-ｚ, Ａ-Ｚ, ０-９)
+        # These characters are often used to bypass string detection/filters
+        $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]+"
+        $fullwidthMatches = [regex]::Matches($allContent, $fullwidthPattern)
+        if ($fullwidthMatches.Count -gt 0) {
+            $uniqueFullwidth = @{}
+            foreach ($match in $fullwidthMatches) {
+                $uniqueFullwidth[$match.Value] = $true
+            }
+            $fullwidthExamples = ($uniqueFullwidth.Keys | Select-Object -First 5) -join ", "
+            $results.Indicators += "FULLWIDTH STRINGS IN CONTENT: $($fullwidthMatches.Count) matches (e.g. $fullwidthExamples)"
+            $results.Detected += @{
+                Name = "Fullwidth Unicode Obfuscation"
+                Pattern = "Content contains $($fullwidthMatches.Count) fullwidth character sequences"
+                Severity = "HIGH"
+            }
+            $score += [math]::Min(40, 20 + ($fullwidthMatches.Count * 3))
+        }
+        
         $cheatObfuscators = @{
             "Skidfuscator" = @("dev/skidfuscator", "Skidfuscator", "skidfuscator.dev", "dev.skidfuscator")
             "Paramorphism" = @("Paramorphism", "paramorphism-", "dev/paramorphism", "paramorphism.dev")
@@ -1795,7 +1789,6 @@ function Test-Obfuscator {
             "Smoke" = @("SmokeObf", "smoke.obf", "smokeobfuscator")
         }
         
-        # Legitime Obfuscatoren (INFO - kein Score)
         $legitObfuscators = @{
             "ProGuard" = @("proguard", "ProGuard")
             "Allatori" = @("allatori", "ALLATORIxDEMO", "com/allatori")
@@ -1804,7 +1797,6 @@ function Test-Obfuscator {
             "R8" = @("com.android.tools.r8", "r8.mapping")
         }
         
-        # Cheat-Obfuscatoren erkennen
         foreach ($obfName in $cheatObfuscators.Keys) {
             foreach ($pattern in $cheatObfuscators[$obfName]) {
                 if ($allContent -match [regex]::Escape($pattern)) {
@@ -1819,7 +1811,6 @@ function Test-Obfuscator {
             }
         }
         
-        # Legitime Obfuscatoren nur als Info
         foreach ($obfName in $legitObfuscators.Keys) {
             foreach ($pattern in $legitObfuscators[$obfName]) {
                 if ($allContent -match [regex]::Escape($pattern)) {
@@ -1835,14 +1826,12 @@ function Test-Obfuscator {
         
         $results.Score = [math]::Min(100, [int]$score)
         
-        # Risk level determination
         if ($results.Score -ge 70) { $results.RiskLevel = "CRITICAL" }
         elseif ($results.Score -ge 50) { $results.RiskLevel = "HIGH" }
         elseif ($results.Score -ge 30) { $results.RiskLevel = "MEDIUM" }
         elseif ($results.Score -ge 15) { $results.RiskLevel = "LOW" }
         else { $results.RiskLevel = "CLEAN" }
         
-        # Add unknown obfuscator if high score but no signature match
         if ($results.Score -gt 35 -and ($results.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -eq 0) {
             $results.Detected += @{
                 Name = "Unknown/Custom Obfuscator"
@@ -1855,10 +1844,6 @@ function Test-Obfuscator {
     
     return $results
 }
-
-# ============================================================================
-# MOD VERIFICATION
-# ============================================================================
 
 $script:LegitModSlugs = @(
     "lithium", "sodium", "phosphor", "starlight", "indium", "iris",
@@ -1934,7 +1919,16 @@ function Test-CheatStrings {
             }
         }
         
-        # Check inside JAR (nested jars, class files)
+        # Check for fullwidth Unicode characters (ａ-ｚ, Ａ-Ｚ, ０-９)
+        # These are often used to bypass string filters
+        $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
+        if ($content -match $fullwidthPattern) {
+            $fullwidthMatches = [regex]::Matches($content, $fullwidthPattern)
+            foreach ($match in $fullwidthMatches) {
+                $foundStrings.Add("FULLWIDTH_UNICODE: $($match.Value)") | Out-Null
+            }
+        }
+        
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
         $entries = $zip.Entries | Where-Object { $_.Name -match '\.(class|json|jar)$' }
@@ -1971,6 +1965,15 @@ function Test-CheatStrings {
                         $foundStrings.Add($string) | Out-Null
                     }
                 }
+                
+                # Check for fullwidth Unicode characters (ａ-ｚ, Ａ-Ｚ, ０-９) in content
+                $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
+                if ($entryContent -match $fullwidthPattern) {
+                    $matches = [regex]::Matches($entryContent, $fullwidthPattern)
+                    foreach ($match in $matches) {
+                        $foundStrings.Add("FULLWIDTH_UNICODE: $($match.Value)") | Out-Null
+                    }
+                }
             } catch {}
         }
         $zip.Dispose()
@@ -1988,7 +1991,6 @@ function Get-ModInfoFromJar {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
         
-        # Check fabric.mod.json
         if ($entry = $zip.Entries | Where-Object { $_.Name -eq 'fabric.mod.json' } | Select-Object -First 1) {
             $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
             $fabricData = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -2001,7 +2003,6 @@ function Get-ModInfoFromJar {
             return $modInfo
         }
         
-        # Check mods.toml (Forge)
         if ($entry = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/mods.toml' } | Select-Object -First 1) {
             $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
             $tomlContent = $reader.ReadToEnd()
@@ -2078,7 +2079,6 @@ function Analyze-ModsFolder {
     Write-Result "INFO" "Found $($jarFiles.Count) mod(s) to analyze"
     Write-Host ""
     
-    # Check disallowed mods
     Check-DisallowedMods -ModsPath $ModsPath
     
     $counter = 0
@@ -2090,7 +2090,6 @@ function Analyze-ModsFolder {
         
         $hash = Get-SHA1Hash -FilePath $file.FullName
         $obfResult = Test-Obfuscator -FilePath $file.FullName
-        # Nur als obfuscated markieren wenn Score hoch ODER Cheat-Obfuscator erkannt
         $hasCriticalObfuscator = ($obfResult.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
         $isObfuscated = ($obfResult.Score -gt 60) -or $hasCriticalObfuscator
         
@@ -2153,18 +2152,15 @@ function Analyze-ModsFolder {
         }
     }
     
-    # Flag heavily obfuscated unknown mods as suspicious (nur bei Cheat-Obfuscatoren oder sehr hohem Score)
     $toMoveToCheat = @()
     foreach ($mod in $script:UnknownMods) {
         $hasCritical = ($mod.ObfuscatorInfo.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
         if (($mod.IsObfuscated -and $mod.ObfuscatorInfo.Score -gt 80) -or $hasCritical) {
-            # Build detailed reason list
             $reasons = @("HEAVY OBFUSCATION (Score: $($mod.ObfuscatorInfo.Score)%)")
             if ($hasCritical) {
                 $critObf = ($mod.ObfuscatorInfo.Detected | Where-Object { $_.Severity -eq "CRITICAL" } | Select-Object -First 1).Name
                 $reasons += "Cheat Obfuscator: $critObf"
             }
-            # Add top indicators
             if ($mod.ObfuscatorInfo.Indicators.Count -gt 0) {
                 $reasons += $mod.ObfuscatorInfo.Indicators | Select-Object -First 3
             }
@@ -2184,7 +2180,6 @@ function Analyze-ModsFolder {
     
     Write-Host "`r$(' ' * 80)`r" -NoNewline
     
-    # Display Results
     if ($script:VerifiedMods.Count -gt 0) {
         Write-Host ""
         Write-Host "  [+] " -NoNewline -ForegroundColor $script:Colors.Success
@@ -2213,15 +2208,10 @@ function Analyze-ModsFolder {
             if ($mod.IsObfuscated) {
                 Write-Host " (Obfuscated: $($mod.ObfuscatorInfo.Score)%)" -NoNewline -ForegroundColor $script:Colors.Error
                 Write-Host " [$($mod.ObfuscatorInfo.RiskLevel)]" -ForegroundColor $(if ($mod.ObfuscatorInfo.RiskLevel -eq "CRITICAL") { "Red" } elseif ($mod.ObfuscatorInfo.RiskLevel -eq "HIGH") { "DarkRed" } else { "Yellow" })
-                # Show indicators
                 if ($mod.ObfuscatorInfo.Indicators.Count -gt 0) {
-                    $topIndicators = $mod.ObfuscatorInfo.Indicators | Select-Object -First 3
-                    foreach ($indicator in $topIndicators) {
+                    foreach ($indicator in $mod.ObfuscatorInfo.Indicators) {
                         Write-Host "        -> " -NoNewline -ForegroundColor $script:Colors.Dim
                         Write-Host $indicator -ForegroundColor $script:Colors.Warning
-                    }
-                    if ($mod.ObfuscatorInfo.Indicators.Count -gt 3) {
-                        Write-Host "        -> ...+$($mod.ObfuscatorInfo.Indicators.Count - 3) more indicators" -ForegroundColor $script:Colors.Dim
                     }
                 }
             } else {
@@ -2267,19 +2257,15 @@ function Analyze-ModsFolder {
                 Write-Host $mod.DependencyName -ForegroundColor $script:Colors.Error
             }
             
-            # Show cheat strings or obfuscation reason
-            Write-Host "        Reason: " -NoNewline -ForegroundColor $script:Colors.Dim
-            $strings = @($mod.StringsFound) | Select-Object -First 8
-            Write-Host ($strings -join ", ") -ForegroundColor $script:Colors.Primary
-            if ($mod.StringsFound.Count -gt 8) {
-                Write-Host "        ...and $($mod.StringsFound.Count - 8) more indicators" -ForegroundColor $script:Colors.Dim
+            Write-Host "        Detected strings:" -ForegroundColor $script:Colors.Warning
+            foreach ($str in @($mod.StringsFound)) {
+                Write-Host "          -> " -NoNewline -ForegroundColor $script:Colors.Dim
+                Write-Host $str -ForegroundColor $script:Colors.Primary
             }
             
-            # Show obfuscation details if heavily obfuscated
             if ($mod.IsObfuscated -and $mod.ObfuscatorInfo -and $mod.ObfuscatorInfo.Indicators.Count -gt 0) {
                 Write-Host "        Obfuscation patterns:" -ForegroundColor $script:Colors.Warning
-                $topIndicators = $mod.ObfuscatorInfo.Indicators | Select-Object -First 4
-                foreach ($indicator in $topIndicators) {
+                foreach ($indicator in $mod.ObfuscatorInfo.Indicators) {
                     Write-Host "          -> $indicator" -ForegroundColor $script:Colors.Dim
                 }
             }
@@ -2306,10 +2292,6 @@ function Get-MinecraftUptime {
         Write-Result "WARN" "No Minecraft process detected"
     }
 }
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
 
 function Run-SystemAnalysis {
     Write-Host ""
@@ -2341,12 +2323,10 @@ function Run-SystemAnalysis {
     Check-JavaArguments
     Check-AdvancedJVMArgs
     
-    # Doomsday Detection
     Check-JavaProcessMemory
     Check-PrefetchFiles
     Check-DoomsdayRegistry
     
-    # Fabric/Forge Injection Scanner
     Check-FabricForgeInjection
     
     Write-Section "System Analysis Summary" "SUM"
@@ -2409,7 +2389,6 @@ function Run-ModAnalysis {
     }
 }
 
-# Main
 Write-Banner
 
 if (-not (Test-AdminPrivileges)) {
