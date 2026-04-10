@@ -1076,53 +1076,39 @@ function Check-JavaProcessMemory {
 }
 function Check-LocalhostWebServer {
     Write-Section "Localhost Web Server Detection (Cheat GUI)" "WEB"
-    Write-Result "INFO" "Scanning localhost ports for Java web servers..."
     try {
-        $listeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-                     Where-Object { $_.LocalAddress -eq "127.0.0.1" -or $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::" } |
-                     Sort-Object LocalPort
-        if ($null -eq $listeners -or $listeners.Count -eq 0) {
-            $netstatOutput = netstat -ano 2>$null | Select-String "LISTENING"
-            $listeners = @()
-            foreach ($line in $netstatOutput) {
-                if ($line -match '(?:TCP\s+)(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]):(\d+)\s+.*LISTENING\s+(\d+)') {
-                    $listeners += [PSCustomObject]@{ 
-                        LocalPort = [int]$Matches[1]
-                        OwningProcess = [int]$Matches[2]
-                        LocalAddress = "127.0.0.1"
-                    }
-                }
-            }
-        }
-        if ($listeners.Count -eq 0) {
-            Write-Result "INFO" "No localhost listening ports found"
-            return
-        }
-        Write-Result "INFO" "Found $($listeners.Count) localhost listening port(s)"
         $javaPids = @()
         $javaProcesses = @()
         $javaProcesses += Get-Process javaw -ErrorAction SilentlyContinue
         $javaProcesses += Get-Process java -ErrorAction SilentlyContinue
         $javaPids = $javaProcesses | ForEach-Object { $_.Id }
-        if ($javaPids.Count -gt 0) {
-            Write-Result "INFO" "Found $($javaPids.Count) Java process(es): PIDs $($javaPids -join ', ')"
+        if ($javaPids.Count -eq 0) {
+            Write-Result "CLEAN" "No Java processes running"
+            return
+        }
+        Write-Result "INFO" "Found $($javaPids.Count) Java process(es) - scanning their ports..."
+        $listeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                     Where-Object { 
+                         ($_.LocalAddress -eq "127.0.0.1" -or $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::") -and
+                         ($javaPids -contains $_.OwningProcess)
+                     } |
+                     Sort-Object LocalPort
+        if ($null -eq $listeners -or $listeners.Count -eq 0) {
+            Write-Result "CLEAN" "Java processes not listening on localhost"
+            return
         }
         foreach ($listener in $listeners) {
             $port = $listener.LocalPort
             $ownerPid = $listener.OwningProcess
-            $localAddr = $listener.LocalAddress
             $processName = "Unknown"
             $processPath = ""
             try {
                 $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
                 if ($proc) {
                     $processName = $proc.ProcessName
-                    try {
-                        $processPath = $proc.Path
-                    } catch {}
+                    try { $processPath = $proc.Path } catch {}
                 }
             } catch {}
-            $isJava = $javaPids -contains $ownerPid
             $isWebServer = $false
             $httpStatus = ""
             $serverHeader = ""
@@ -1145,10 +1131,7 @@ function Check-LocalhostWebServer {
                     }
                 }
             } catch {}
-            if ($isWebServer -and $isJava) {
-                $webServersFound++
-                $javaWebServers++
-                $found = $true
+            if ($isWebServer) {
                 $serverInfo = if ($serverHeader) { " Server: $serverHeader" } else { "" }
                 Write-Result "FOUND" "WEB SERVER localhost:$port [JAVA!]" "$processName (PID $ownerPid) - $httpStatus$serverInfo"
                 Write-Result "WARN" "  SUSPICIOUS: Java hosting web server - possible Cheat GUI!"
@@ -1167,15 +1150,13 @@ function Check-LocalhostWebServer {
                     Server = $serverHeader
                     Severity = "CRITICAL"
                 }
-                Write-Result "WARN" "Java web server found - stopping scan"
                 return
             }
         }
-        Write-Result "INFO" "Scanned $($listeners.Count) ports - no Java web servers"
+        Write-Result "CLEAN" "Java ports checked - no web servers"
     } catch {
         Write-Result "WARN" "Could not enumerate network connections: $_"
     }
-    Write-Result "CLEAN" "No Java-hosted web servers detected"
 }
 function Check-CustomFonts {
     Write-Section "Custom Font Analysis (Cheat UI Detection)" "FNT"
