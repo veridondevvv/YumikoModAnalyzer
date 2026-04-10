@@ -1249,6 +1249,175 @@ function Check-JavaProcessMemory {
     }
 }
 
+function Check-LocalhostWebServer {
+    Write-Section "Localhost Web Server Detection (Doomsday GUI)" "WEB"
+    
+    $found = $false
+    
+    # Common ports used by cheat clients for their web GUI
+    $suspiciousPorts = @(
+        @{ Port = 80; Desc = "HTTP default" },
+        @{ Port = 8080; Desc = "Alt HTTP" },
+        @{ Port = 8888; Desc = "Common cheat port" },
+        @{ Port = 3000; Desc = "Node/React dev" },
+        @{ Port = 4000; Desc = "Common app port" },
+        @{ Port = 5000; Desc = "Flask/Dev server" },
+        @{ Port = 9000; Desc = "PHP-FPM/Dev" },
+        @{ Port = 1337; Desc = "Leet port (cheat)" },
+        @{ Port = 6969; Desc = "Meme port (cheat)" },
+        @{ Port = 25565; Desc = "MC Server port" },
+        @{ Port = 8443; Desc = "HTTPS alt" },
+        @{ Port = 7777; Desc = "Game server" }
+    )
+    
+    Write-Result "INFO" "Checking for Java-hosted localhost web servers..."
+    
+    try {
+        # Get all listening TCP connections
+        $listeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                     Where-Object { $_.LocalAddress -eq "127.0.0.1" -or $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::" }
+        
+        if ($null -eq $listeners -or $listeners.Count -eq 0) {
+            # Fallback: use netstat
+            $netstatOutput = netstat -an 2>$null | Select-String "LISTENING"
+            $listeners = @()
+            foreach ($line in $netstatOutput) {
+                if ($line -match '(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]):(\d+)') {
+                    $listeners += @{ LocalPort = [int]$Matches[1]; OwningProcess = 0 }
+                }
+            }
+        }
+        
+        # Get Java process PIDs
+        $javaPids = @()
+        $javaProcesses = @()
+        $javaProcesses += Get-Process javaw -ErrorAction SilentlyContinue
+        $javaProcesses += Get-Process java -ErrorAction SilentlyContinue
+        $javaPids = $javaProcesses | ForEach-Object { $_.Id }
+        
+        if ($javaPids.Count -eq 0) {
+            Write-Result "INFO" "No Java processes running"
+        } else {
+            Write-Result "INFO" "Found $($javaPids.Count) Java process(es)"
+        }
+        
+        # Check each suspicious port
+        foreach ($portInfo in $suspiciousPorts) {
+            $port = $portInfo.Port
+            $desc = $portInfo.Desc
+            
+            # Check if port is listening
+            $listening = $listeners | Where-Object { $_.LocalPort -eq $port }
+            
+            if ($listening) {
+                $ownerPid = if ($listening.OwningProcess) { $listening.OwningProcess } else { 0 }
+                $isJava = $javaPids -contains $ownerPid
+                
+                # Try HTTP request to check if web server responds
+                try {
+                    $webRequest = [System.Net.WebRequest]::Create("http://127.0.0.1:$port/")
+                    $webRequest.Timeout = 1000
+                    $webRequest.Method = "GET"
+                    
+                    try {
+                        $response = $webRequest.GetResponse()
+                        $statusCode = [int]$response.StatusCode
+                        $contentType = $response.ContentType
+                        $response.Close()
+                        
+                        $severity = if ($isJava) { "CRITICAL" } else { "WARN" }
+                        $javaText = if ($isJava) { " [JAVA PROCESS!]" } else { "" }
+                        
+                        Write-Result "FOUND" "Web server on localhost:$port$javaText" "$desc (HTTP $statusCode)"
+                        
+                        if ($isJava) {
+                            Write-Result "WARN" "  Java PID $ownerPid is hosting a web server - possible cheat GUI!"
+                        }
+                        
+                        $script:SystemFindings += @{
+                            Type = "LocalhostWebServer"
+                            Description = "Web server on port $port ($desc)"
+                            Port = $port
+                            IsJava = $isJava
+                            PID = $ownerPid
+                            StatusCode = $statusCode
+                            Severity = $severity
+                        }
+                        $found = $true
+                        
+                    } catch [System.Net.WebException] {
+                        # Server responded but with error - still a web server
+                        $errorResponse = $_.Exception.Response
+                        if ($null -ne $errorResponse) {
+                            $statusCode = [int]$errorResponse.StatusCode
+                            $javaText = if ($isJava) { " [JAVA!]" } else { "" }
+                            
+                            Write-Result "FOUND" "Web server on localhost:$port$javaText" "$desc (HTTP $statusCode)"
+                            
+                            if ($isJava) {
+                                Write-Result "WARN" "  Java PID $ownerPid hosting web server!"
+                            }
+                            
+                            $script:SystemFindings += @{
+                                Type = "LocalhostWebServer"
+                                Description = "Web server on port $port"
+                                Port = $port
+                                IsJava = $isJava
+                                PID = $ownerPid
+                                Severity = if ($isJava) { "HIGH" } else { "MEDIUM" }
+                            }
+                            $found = $true
+                        }
+                    }
+                } catch {
+                    # Port is listening but not HTTP - could be other protocol
+                    if ($isJava) {
+                        Write-Result "INFO" "Java listening on port $port (non-HTTP)"
+                    }
+                }
+            }
+        }
+        
+        # Additional check: Look for any Java process with listening ports
+        foreach ($pid in $javaPids) {
+            $javaListeners = $listeners | Where-Object { $_.OwningProcess -eq $pid }
+            foreach ($l in $javaListeners) {
+                $port = $l.LocalPort
+                # Skip already checked ports
+                if ($suspiciousPorts.Port -notcontains $port) {
+                    Write-Result "INFO" "Java PID $pid listening on port $port"
+                    
+                    # Try HTTP check
+                    try {
+                        $webRequest = [System.Net.WebRequest]::Create("http://127.0.0.1:$port/")
+                        $webRequest.Timeout = 500
+                        $response = $webRequest.GetResponse()
+                        $response.Close()
+                        
+                        Write-Result "FOUND" "Java web server on localhost:$port" "PID $pid"
+                        $script:SystemFindings += @{
+                            Type = "LocalhostWebServer"
+                            Description = "Java web server on port $port"
+                            Port = $port
+                            IsJava = $true
+                            PID = $pid
+                            Severity = "HIGH"
+                        }
+                        $found = $true
+                    } catch {}
+                }
+            }
+        }
+        
+    } catch {
+        Write-Result "WARN" "Could not enumerate network connections"
+    }
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious localhost web servers detected"
+    }
+}
+
 function Check-PrefetchFiles {
     Write-Section "Windows Prefetch Forensics (JAR Parser)" "PF"
     
@@ -2605,6 +2774,7 @@ function Run-SystemAnalysis {
     Check-AdvancedJVMArgs
     
     Check-JavaProcessMemory
+    Check-LocalhostWebServer
     Check-PrefetchFiles
     Check-DoomsdayRegistry
     
