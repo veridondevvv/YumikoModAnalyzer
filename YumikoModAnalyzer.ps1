@@ -171,6 +171,147 @@ try {
     $script:MemoryAPILoaded = $false
 }
 
+# === DOOMSDAY BYTE SIGNATURES (from DoomsDayDetector v4.6) ===
+$script:DoomsdayBytePatterns = @(
+    "6161370E160609949E002903EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A160C14005C6588B800",
+    "0C1504851D85160A6161370E160609949E002903EA7000A2C1D03548403011D1008A1FFF6033EA7000A2B1D03548403011D07A1FFF710FEAC150599001A2A16",
+    "5910071088544C2A2BB8004D3B033DA7000A2B1C03548402011C1008A1FFF61A9E000C1A110800A2000503AC04AC00000000000A0005004E000101FA000001D3"
+)
+
+# Doomsday class patterns (obfuscated package names)
+$script:DoomsdayClassPatterns = @(
+    "net/java/f", "net/java/g", "net/java/h", "net/java/i", 
+    "net/java/k", "net/java/l", "net/java/m", "net/java/r", 
+    "net/java/s", "net/java/t", "net/java/y"
+)
+
+# Helper: Convert hex string to byte array
+function Convert-HexToBytes {
+    param([string]$hex)
+    $bytes = New-Object byte[] ($hex.Length / 2)
+    for ($i = 0; $i -lt $hex.Length; $i += 2) {
+        $bytes[$i / 2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+    }
+    return $bytes
+}
+
+# Helper: Check if byte array contains pattern
+function Test-BytePattern {
+    param([byte[]]$data, [byte[]]$pattern)
+    for ($i = 0; $i -le $data.Length - $pattern.Length; $i++) {
+        $match = $true
+        for ($j = 0; $j -lt $pattern.Length; $j++) {
+            if ($data[$i + $j] -ne $pattern[$j]) {
+                $match = $false
+                break
+            }
+        }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+# Helper: Check if byte array contains class string
+function Test-ClassString {
+    param([byte[]]$data, [string]$classPattern)
+    $patternBytes = [System.Text.Encoding]::ASCII.GetBytes($classPattern)
+    return Test-BytePattern $data $patternBytes
+}
+
+# Helper: Count single-letter class files in JAR
+function Get-SingleLetterClassCount {
+    param([string]$jarPath)
+    $count = 0
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName -like "*.class") {
+                $name = [System.IO.Path]::GetFileNameWithoutExtension($entry.FullName)
+                if ($name -match '^[a-zA-Z]$') { $count++ }
+            }
+        }
+        $zip.Dispose()
+    } catch {}
+    return $count
+}
+
+# Core Doomsday JAR Detection Function
+function Test-DoomsdayJar {
+    param([string]$jarPath)
+    
+    $result = @{
+        Detected = $false
+        Confidence = "NONE"
+        ByteMatches = 0
+        ClassMatches = 0
+        SingleLetterClasses = 0
+    }
+    
+    try {
+        if (-not (Test-Path $jarPath -PathType Leaf)) { return $result }
+        
+        $fileInfo = Get-Item $jarPath -ErrorAction SilentlyContinue
+        if (-not $fileInfo) { return $result }
+        
+        # Size filter: typical ghost clients are 200KB-20MB
+        if ($fileInfo.Length -lt 200KB -or $fileInfo.Length -gt 20MB) { return $result }
+        
+        # Check ZIP header (PK)
+        $header = [System.IO.File]::ReadAllBytes($jarPath) | Select-Object -First 2
+        if ($header[0] -ne 0x50 -or $header[1] -ne 0x4B) { return $result }
+        
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+        
+        $classes = $zip.Entries | Where-Object { $_.FullName -like "*.class" }
+        
+        # Ghost clients typically have <70 classes
+        if ($classes.Count -gt 70) {
+            $zip.Dispose()
+            return $result
+        }
+        
+        # Read all class bytes
+        $allBytes = @()
+        foreach ($entry in $classes) {
+            $stream = $entry.Open()
+            $reader = New-Object System.IO.BinaryReader($stream)
+            $allBytes += $reader.ReadBytes([int]$entry.Length)
+            $reader.Close()
+            $stream.Close()
+        }
+        $zip.Dispose()
+        
+        # Check Doomsday byte patterns
+        foreach ($hexPattern in $script:DoomsdayBytePatterns) {
+            $patternBytes = Convert-HexToBytes $hexPattern
+            if (Test-BytePattern $allBytes $patternBytes) {
+                $result.ByteMatches++
+            }
+        }
+        
+        # Check Doomsday class patterns
+        foreach ($classPattern in $script:DoomsdayClassPatterns) {
+            if (Test-ClassString $allBytes $classPattern) {
+                $result.ClassMatches++
+            }
+        }
+        
+        # Count single-letter classes
+        $result.SingleLetterClasses = Get-SingleLetterClassCount $jarPath
+        
+        # Detection logic (from DoomsDayDetector)
+        if ($result.ByteMatches -ge 1 -or $result.ClassMatches -ge 2 -or $result.SingleLetterClasses -ge 4) {
+            $result.Detected = $true
+            $result.Confidence = "HIGH"
+        }
+        
+    } catch {}
+    
+    return $result
+}
+
 $script:SystemFindings = @()
 $script:JvmFlags = @()
 $script:BypassMods = @()
@@ -1467,6 +1608,151 @@ function Check-DoomsdayRegistry {
     }
 }
 
+# === DOOMSDAY JAR SCANNER (DoomsDayDetector v4.6 Style) ===
+function Check-DoomsdayJarFiles {
+    Write-Section "Doomsday JAR Byte Pattern Scanner" "JAR"
+    
+    $found = $false
+    $scannedCount = 0
+    $detections = @()
+    
+    Write-Result "INFO" "Scanning JAR files for Doomsday byte signatures..."
+    
+    # Scan mods folder
+    $modsPaths = @(
+        "$env:APPDATA\.minecraft\mods",
+        "$env:APPDATA\.minecraft\versions",
+        "$env:APPDATA\PrismLauncher\instances",
+        "$env:APPDATA\MultiMC\instances",
+        "$env:APPDATA\.lunarclient\offline\multiver\mods",
+        "$env:USERPROFILE\curseforge\minecraft\Instances",
+        "$env:TEMP"
+    )
+    
+    $jarFiles = @()
+    
+    foreach ($modsPath in $modsPaths) {
+        if (Test-Path $modsPath) {
+            $jars = Get-ChildItem -Path $modsPath -Filter "*.jar" -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Length -gt 200KB -and $_.Length -lt 20MB }
+            $jarFiles += $jars
+        }
+    }
+    
+    # Also get JARs from Prefetch analysis
+    $prefetchPath = "$env:SystemRoot\Prefetch"
+    if (Test-Path $prefetchPath) {
+        try {
+            # Decompress and parse Prefetch files
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class PrefetchDecompressor {
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlDecompressBufferEx(ushort cf, byte[] ub, int ubs, byte[] cb, int cbs, out int fus, IntPtr ws);
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlGetCompressionWorkSpaceSize(ushort cf, out uint cws, out uint fws);
+    
+    public static byte[] Decompress(byte[] c) {
+        if (c.Length < 8 || c[0] != 0x4D || c[1] != 0x41 || c[2] != 0x4D) return null;
+        int us = BitConverter.ToInt32(c, 4);
+        uint cws, fws;
+        if (RtlGetCompressionWorkSpaceSize(4, out cws, out fws) != 0) return null;
+        IntPtr ws = Marshal.AllocHGlobal((int)fws);
+        byte[] r = new byte[us];
+        try {
+            byte[] cd = new byte[c.Length - 8];
+            Array.Copy(c, 8, cd, 0, cd.Length);
+            int fs;
+            uint st = RtlDecompressBufferEx(4, r, us, cd, cd.Length, out fs, ws);
+            return (st == 0) ? r : null;
+        } finally { Marshal.FreeHGlobal(ws); }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+            
+            $javaPfs = Get-ChildItem "$prefetchPath\JAVA*.EXE-*.pf" -ErrorAction SilentlyContinue
+            foreach ($pf in $javaPfs) {
+                try {
+                    $data = [System.IO.File]::ReadAllBytes($pf.FullName)
+                    
+                    # Try to decompress if MAM header
+                    if ($data[0] -eq 0x4D -and $data[1] -eq 0x41 -and $data[2] -eq 0x4D) {
+                        $data = [PrefetchDecompressor]::Decompress($data)
+                    }
+                    
+                    if ($null -ne $data -and $data.Length -gt 108) {
+                        $stringsOffset = [BitConverter]::ToUInt32($data, 100)
+                        $stringsSize = [BitConverter]::ToUInt32($data, 104)
+                        
+                        if ($stringsOffset -gt 0 -and $stringsSize -gt 0) {
+                            $pos = $stringsOffset
+                            $end = $stringsOffset + $stringsSize
+                            
+                            while ($pos -lt $end -and $pos -lt $data.Length - 1) {
+                                $nullPos = $pos
+                                while ($nullPos -lt $data.Length - 1 -and -not ($data[$nullPos] -eq 0 -and $data[$nullPos + 1] -eq 0)) {
+                                    $nullPos += 2
+                                }
+                                
+                                if ($nullPos -gt $pos) {
+                                    $str = [System.Text.Encoding]::Unicode.GetString($data, $pos, $nullPos - $pos).Trim()
+                                    if ($str -like "*.jar" -and $str.Length -gt 5) {
+                                        $cleanPath = $str -replace '^\\VOLUME\{[^}]+\}\\', 'C:\'
+                                        if (Test-Path $cleanPath -PathType Leaf -ErrorAction SilentlyContinue) {
+                                            $jarFiles += Get-Item $cleanPath -ErrorAction SilentlyContinue
+                                        }
+                                    }
+                                }
+                                $pos = $nullPos + 2
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+    
+    # Remove duplicates
+    $jarFiles = $jarFiles | Select-Object -Unique -Property FullName | ForEach-Object { Get-Item $_.FullName -ErrorAction SilentlyContinue }
+    
+    Write-Result "INFO" "Found $($jarFiles.Count) JAR files to scan"
+    
+    foreach ($jar in $jarFiles) {
+        if (-not $jar) { continue }
+        
+        $scannedCount++
+        $result = Test-DoomsdayJar $jar.FullName
+        
+        if ($result.Detected) {
+            $found = $true
+            Write-Result "FOUND" "DOOMSDAY DETECTED [$($result.Confidence)]" "$($jar.Name)"
+            Write-Result "INFO" "  ByteMatches: $($result.ByteMatches), ClassMatches: $($result.ClassMatches), SingleLetter: $($result.SingleLetterClasses)"
+            Write-Result "INFO" "  Path: $($jar.FullName)"
+            
+            $script:SystemFindings += @{
+                Type = "DoomsdayJAR"
+                Description = "Doomsday client JAR detected: $($jar.Name)"
+                Path = $jar.FullName
+                Confidence = $result.Confidence
+                ByteMatches = $result.ByteMatches
+                ClassMatches = $result.ClassMatches
+                Severity = "CRITICAL"
+            }
+            
+            $detections += $jar.FullName
+        }
+    }
+    
+    Write-Result "INFO" "Scanned $scannedCount JAR files"
+    
+    if (-not $found) {
+        Write-Result "CLEAN" "No Doomsday JAR signatures detected"
+    } else {
+        Write-Result "WARN" "Found $($detections.Count) Doomsday detection(s)!"
+    }
+}
+
 function Check-FabricForgeInjection {
     Write-Section "Fabric/Forge JVM Injection Scanner" "INJ"
     
@@ -2607,6 +2893,7 @@ function Run-SystemAnalysis {
     Check-JavaProcessMemory
     Check-PrefetchFiles
     Check-DoomsdayRegistry
+    Check-DoomsdayJarFiles
     
     Check-FabricForgeInjection
     
