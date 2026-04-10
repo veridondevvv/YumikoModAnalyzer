@@ -188,16 +188,27 @@ $script:DoomsdayClassPatterns = @(
 # Helper: Convert hex string to byte array
 function Convert-HexToBytes {
     param([string]$hex)
-    $bytes = New-Object byte[] ($hex.Length / 2)
-    for ($i = 0; $i -lt $hex.Length; $i += 2) {
-        $bytes[$i / 2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+    # Remove spaces and whitespace
+    $hex = $hex -replace '\s+', ''
+    # Ensure even length
+    if ($hex.Length % 2 -ne 0) { return @() }
+    if ($hex.Length -eq 0) { return @() }
+    try {
+        $bytes = New-Object byte[] ($hex.Length / 2)
+        for ($i = 0; $i -lt $hex.Length; $i += 2) {
+            $bytes[$i / 2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+        }
+        return $bytes
+    } catch {
+        return @()
     }
-    return $bytes
 }
 
 # Helper: Check if byte array contains pattern
 function Test-BytePattern {
     param([byte[]]$data, [byte[]]$pattern)
+    if ($null -eq $pattern -or $pattern.Length -eq 0) { return $false }
+    if ($null -eq $data -or $data.Length -lt $pattern.Length) { return $false }
     for ($i = 0; $i -le $data.Length - $pattern.Length; $i++) {
         $match = $true
         for ($j = 0; $j -lt $pattern.Length; $j++) {
@@ -246,6 +257,8 @@ function Test-DoomsdayJar {
         ByteMatches = 0
         ClassMatches = 0
         SingleLetterClasses = 0
+        GhostIndicators = 0
+        Reason = ""
     }
     
     try {
@@ -254,8 +267,8 @@ function Test-DoomsdayJar {
         $fileInfo = Get-Item $jarPath -ErrorAction SilentlyContinue
         if (-not $fileInfo) { return $result }
         
-        # Size filter: typical ghost clients are 200KB-20MB
-        if ($fileInfo.Length -lt 200KB -or $fileInfo.Length -gt 20MB) { return $result }
+        # Size filter: typical ghost clients are 100KB-50MB
+        if ($fileInfo.Length -lt 100KB -or $fileInfo.Length -gt 50MB) { return $result }
         
         # Check ZIP header (PK)
         $header = [System.IO.File]::ReadAllBytes($jarPath) | Select-Object -First 2
@@ -264,50 +277,140 @@ function Test-DoomsdayJar {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
         $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
         
-        $classes = $zip.Entries | Where-Object { $_.FullName -like "*.class" }
+        $allEntries = @($zip.Entries)
+        $classes = @($allEntries | Where-Object { $_.FullName -like "*.class" })
         
-        # Ghost clients typically have <70 classes
-        if ($classes.Count -gt 70) {
-            $zip.Dispose()
-            return $result
+        # Ghost clients typically have few classes (but some have many)
+        # Removed strict 70 class limit - check other indicators instead
+        
+        # Count single-letter classes FIRST (before reading bytes)
+        $singleLetterCount = 0
+        $netJavaCount = 0
+        $suspiciousPackages = 0
+        
+        foreach ($entry in $classes) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($entry.FullName)
+            $fullName = $entry.FullName
+            
+            # Single letter class names (strong indicator)
+            if ($name -match '^[a-zA-Z]$') { $singleLetterCount++ }
+            
+            # net/java/ package (Doomsday obfuscation)
+            if ($fullName -like "net/java/*") { $netJavaCount++ }
+            
+            # Suspicious obfuscated package patterns
+            if ($fullName -match '^[a-z]/[a-z]/[a-z]\.class$') { $suspiciousPackages++ }
+            if ($fullName -match '^[a-z]{1,2}/[a-z]{1,2}\.class$') { $suspiciousPackages++ }
         }
         
-        # Read all class bytes
-        $allBytes = @()
+        $result.SingleLetterClasses = $singleLetterCount
+        
+        # Read class bytes for pattern matching (limit to first 500KB to speed up)
+        $allBytes = New-Object System.Collections.Generic.List[byte]
+        $bytesRead = 0
+        $maxBytes = 500KB
+        
         foreach ($entry in $classes) {
-            $stream = $entry.Open()
-            $reader = New-Object System.IO.BinaryReader($stream)
-            $allBytes += $reader.ReadBytes([int]$entry.Length)
-            $reader.Close()
-            $stream.Close()
+            if ($bytesRead -gt $maxBytes) { break }
+            try {
+                $stream = $entry.Open()
+                $reader = New-Object System.IO.BinaryReader($stream)
+                $entryBytes = $reader.ReadBytes([int][Math]::Min($entry.Length, $maxBytes - $bytesRead))
+                $allBytes.AddRange($entryBytes)
+                $bytesRead += $entryBytes.Length
+                $reader.Close()
+                $stream.Close()
+            } catch {}
         }
         $zip.Dispose()
+        
+        $bytesArray = $allBytes.ToArray()
         
         # Check Doomsday byte patterns
         foreach ($hexPattern in $script:DoomsdayBytePatterns) {
             $patternBytes = Convert-HexToBytes $hexPattern
-            if (Test-BytePattern $allBytes $patternBytes) {
+            if (Test-BytePattern $bytesArray $patternBytes) {
                 $result.ByteMatches++
             }
         }
         
-        # Check Doomsday class patterns
+        # Check Doomsday class patterns in bytecode
         foreach ($classPattern in $script:DoomsdayClassPatterns) {
-            if (Test-ClassString $allBytes $classPattern) {
+            if (Test-ClassString $bytesArray $classPattern) {
                 $result.ClassMatches++
             }
         }
         
-        # Count single-letter classes
-        $result.SingleLetterClasses = Get-SingleLetterClassCount $jarPath
+        # Additional ghost client indicators in bytecode
+        $ghostStrings = @(
+            "KillAura", "Velocity", "AntiKB", "Scaffold", "Reach", "AutoClicker",
+            "ESP", "Tracers", "Fullbright", "NoFall", "Speed", "Fly", "Phase",
+            "ClickGUI", "HUD", "Module", "CheatModule", "Hack", "Client"
+        )
         
-        # Detection logic (from DoomsDayDetector)
-        if ($result.ByteMatches -ge 1 -or $result.ClassMatches -ge 2 -or $result.SingleLetterClasses -ge 4) {
-            $result.Detected = $true
-            $result.Confidence = "HIGH"
+        foreach ($gs in $ghostStrings) {
+            if (Test-ClassString $bytesArray $gs) {
+                $result.GhostIndicators++
+            }
         }
         
-    } catch {}
+        # Calculate obfuscation ratio
+        $obfuscationRatio = if ($classes.Count -gt 0) { $singleLetterCount / $classes.Count } else { 0 }
+        
+        # === DETECTION LOGIC ===
+        
+        # Doomsday specific: byte pattern match
+        if ($result.ByteMatches -ge 1) {
+            $result.Detected = $true
+            $result.Confidence = "HIGH"
+            $result.Reason = "Doomsday byte pattern matched"
+        }
+        # Doomsday specific: net/java/ obfuscation
+        elseif ($netJavaCount -ge 3) {
+            $result.Detected = $true
+            $result.Confidence = "HIGH"
+            $result.Reason = "net/java/ obfuscation pattern ($netJavaCount classes)"
+        }
+        # Doomsday class patterns
+        elseif ($result.ClassMatches -ge 2) {
+            $result.Detected = $true
+            $result.Confidence = "HIGH"
+            $result.Reason = "Doomsday class patterns matched"
+        }
+        # HIGH obfuscation ratio (>50% single-letter classes with few total classes)
+        elseif ($obfuscationRatio -gt 0.5 -and $classes.Count -lt 50) {
+            $result.Detected = $true
+            $result.Confidence = "HIGH"
+            $result.Reason = "Extreme obfuscation ($([int]($obfuscationRatio*100))% single-letter, $($classes.Count) classes)"
+        }
+        # Heavy single-letter obfuscation (ghost client indicator)
+        elseif ($singleLetterCount -ge 10 -and $classes.Count -lt 100) {
+            $result.Detected = $true
+            $result.Confidence = "MEDIUM"
+            $result.Reason = "Heavy obfuscation ($singleLetterCount single-letter classes)"
+        }
+        # Low class count + single letters (ghost client)
+        elseif ($classes.Count -lt 50 -and $singleLetterCount -ge 4) {
+            $result.Detected = $true
+            $result.Confidence = "MEDIUM"
+            $result.Reason = "Low class count + obfuscation"
+        }
+        # Many ghost indicators
+        elseif ($result.GhostIndicators -ge 5) {
+            $result.Detected = $true
+            $result.Confidence = "MEDIUM"
+            $result.Reason = "Multiple ghost client indicators ($($result.GhostIndicators))"
+        }
+        # Suspicious package structure
+        elseif ($suspiciousPackages -ge 5) {
+            $result.Detected = $true
+            $result.Confidence = "LOW"
+            $result.Reason = "Suspicious package structure"
+        }
+        
+    } catch {
+        # Silent catch - errors mean file is not a valid cheat JAR
+    }
     
     return $result
 }
@@ -1610,31 +1713,48 @@ function Check-DoomsdayRegistry {
 
 # === DOOMSDAY JAR SCANNER (DoomsDayDetector v4.6 Style) ===
 function Check-DoomsdayJarFiles {
-    Write-Section "Doomsday JAR Byte Pattern Scanner" "JAR"
+    Write-Section "Ghost Client / Doomsday JAR Scanner" "JAR"
     
     $found = $false
     $scannedCount = 0
     $detections = @()
     
-    Write-Result "INFO" "Scanning JAR files for Doomsday byte signatures..."
+    Write-Result "INFO" "Scanning JAR files for Ghost Client signatures..."
     
-    # Scan mods folder
-    $modsPaths = @(
+    # Scan mods folder AND common external JAR locations
+    # Note: We don't recursively scan APPDATA/LOCALAPPDATA to avoid scanning thousands of Java/IDE files
+    $recursePaths = @(
         "$env:APPDATA\.minecraft\mods",
         "$env:APPDATA\.minecraft\versions",
         "$env:APPDATA\PrismLauncher\instances",
         "$env:APPDATA\MultiMC\instances",
         "$env:APPDATA\.lunarclient\offline\multiver\mods",
-        "$env:USERPROFILE\curseforge\minecraft\Instances",
+        "$env:USERPROFILE\curseforge\minecraft\Instances"
+    )
+    
+    $directPaths = @(
+        # Direct scan without recursion (external/injection JARs)
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
         "$env:TEMP"
     )
     
     $jarFiles = @()
     
-    foreach ($modsPath in $modsPaths) {
+    # Recursive scan for Minecraft-related folders
+    foreach ($modsPath in $recursePaths) {
         if (Test-Path $modsPath) {
             $jars = Get-ChildItem -Path $modsPath -Filter "*.jar" -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Length -gt 200KB -and $_.Length -lt 20MB }
+                    Where-Object { $_.Length -gt 100KB -and $_.Length -lt 50MB }
+            $jarFiles += $jars
+        }
+    }
+    
+    # Direct scan (no recursion) for user folders
+    foreach ($directPath in $directPaths) {
+        if (Test-Path $directPath) {
+            $jars = Get-ChildItem -Path $directPath -Filter "*.jar" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Length -gt 100KB -and $_.Length -lt 50MB }
             $jarFiles += $jars
         }
     }
@@ -1726,17 +1846,19 @@ public class PrefetchDecompressor {
         
         if ($result.Detected) {
             $found = $true
-            Write-Result "FOUND" "DOOMSDAY DETECTED [$($result.Confidence)]" "$($jar.Name)"
-            Write-Result "INFO" "  ByteMatches: $($result.ByteMatches), ClassMatches: $($result.ClassMatches), SingleLetter: $($result.SingleLetterClasses)"
+            Write-Result "FOUND" "GHOST CLIENT DETECTED [$($result.Confidence)]" "$($jar.Name)"
+            Write-Result "INFO" "  Reason: $($result.Reason)"
+            Write-Result "INFO" "  ByteMatches: $($result.ByteMatches), ClassMatches: $($result.ClassMatches), SingleLetter: $($result.SingleLetterClasses), GhostInd: $($result.GhostIndicators)"
             Write-Result "INFO" "  Path: $($jar.FullName)"
             
             $script:SystemFindings += @{
                 Type = "DoomsdayJAR"
-                Description = "Doomsday client JAR detected: $($jar.Name)"
+                Description = "Ghost client JAR detected: $($jar.Name) - $($result.Reason)"
                 Path = $jar.FullName
                 Confidence = $result.Confidence
                 ByteMatches = $result.ByteMatches
                 ClassMatches = $result.ClassMatches
+                Reason = $result.Reason
                 Severity = "CRITICAL"
             }
             
@@ -1747,9 +1869,9 @@ public class PrefetchDecompressor {
     Write-Result "INFO" "Scanned $scannedCount JAR files"
     
     if (-not $found) {
-        Write-Result "CLEAN" "No Doomsday JAR signatures detected"
+        Write-Result "CLEAN" "No Ghost Client JAR signatures detected"
     } else {
-        Write-Result "WARN" "Found $($detections.Count) Doomsday detection(s)!"
+        Write-Result "WARN" "Found $($detections.Count) Ghost Client detection(s)!"
     }
 }
 
@@ -2955,6 +3077,13 @@ function Run-ModAnalysis {
     } else {
         Write-Result "PASS" "No cheat mods detected"
     }
+}
+
+# === MAIN ENTRY POINT ===
+# Skip auto-run if $env:YUMIKO_TEST is set (for unit testing)
+if ($env:YUMIKO_TEST -eq "1") {
+    Write-Host "[TEST MODE] Functions loaded - skipping auto-run" -ForegroundColor Cyan
+    return
 }
 
 Write-Banner
