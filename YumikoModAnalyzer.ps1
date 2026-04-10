@@ -112,6 +112,65 @@ function Write-ProgressBar {
     Write-Host "`r    [$bar] $percent% - $Activity" -NoNewline -ForegroundColor $script:Colors.Secondary
 }
 
+# === WINDOWS API DEFINITIONS FOR MEMORY SCANNING (MeowDoomsdayFucker Style) ===
+$script:MemoryAPILoaded = $false
+try {
+    Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    
+    public static class MemoryScanner {
+        // Process access rights
+        public const uint PROCESS_VM_READ = 0x0010;
+        public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        
+        // Memory state constants
+        public const uint MEM_COMMIT = 0x1000;
+        
+        // Memory protection constants
+        public const uint PAGE_READONLY = 0x02;
+        public const uint PAGE_READWRITE = 0x04;
+        public const uint PAGE_EXECUTE_READ = 0x20;
+        public const uint PAGE_EXECUTE_READWRITE = 0x40;
+        public const uint PAGE_GUARD = 0x100;
+        
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORY_BASIC_INFORMATION {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+        
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+        
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr hObject);
+        
+        [DllImport("kernel32.dll")]
+        public static extern int VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
+        
+        [DllImport("kernel32.dll")]
+        public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
+        
+        public static bool IsReadableProtection(uint protect) {
+            if ((protect & PAGE_GUARD) != 0) return false;
+            return (protect == PAGE_READONLY || 
+                    protect == PAGE_READWRITE || 
+                    protect == PAGE_EXECUTE_READ || 
+                    protect == PAGE_EXECUTE_READWRITE);
+        }
+    }
+"@ -ErrorAction SilentlyContinue
+    $script:MemoryAPILoaded = $true
+} catch {
+    $script:MemoryAPILoaded = $false
+}
+
 $script:SystemFindings = @()
 $script:JvmFlags = @()
 $script:BypassMods = @()
@@ -1027,14 +1086,19 @@ function Check-AdvancedJVMArgs {
 }
 
 function Check-JavaProcessMemory {
-    Write-Section "Java Process Memory Analysis" "MEM"
+    Write-Section "Java Process Memory Analysis (Doomsday Fucker)" "MEM"
     
     $found = $false
     
+    # Extended Doomsday-specific signatures (obfuscated patterns from MeowDoomsdayFucker research)
     $doomsdaySignatures = @(
         "doomsday", "DoomsdayClient", "doomsdayclient.com",
         "com.doomsday", "net.doomsday", "doomsday.module",
-        "DoomsdayMod", "DoomsdayCore", "DoomsdayLoader"
+        "DoomsdayMod", "DoomsdayCore", "DoomsdayLoader",
+        "DOOMSDAY_HWID", "doomsday_config", "doomsday_auth",
+        "DoomsdayKillAura", "DoomsdayESP", "DoomsdayFly",
+        "doom_bypass", "DoomsdayAPI", "doomsday.bypass",
+        "doomsday.aimbot", "doomsday.velocity", "DoomVelocity"
     )
     
     $cheatSignatures = @(
@@ -1055,13 +1119,15 @@ function Check-JavaProcessMemory {
         
         if ($javaProcesses.Count -eq 0) {
             Write-Result "INFO" "No Java processes running"
+            Write-Result "INFO" "Start Minecraft to scan for Doomsday in memory"
             return
         }
         
-        Write-Result "INFO" "Found $($javaProcesses.Count) Java process(es) - scanning..."
+        Write-Result "INFO" "Found $($javaProcesses.Count) Java process(es) - deep memory scan..."
         
         foreach ($proc in $javaProcesses) {
             try {
+                # Phase 1: Command line check (quick scan)
                 $wmi = Get-WmiObject Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
                 $cmdLine = if ($wmi) { $wmi.CommandLine } else { "" }
                 
@@ -1077,7 +1143,102 @@ function Check-JavaProcessMemory {
                         $found = $true
                     }
                 }
-            } catch {}
+                
+                # Phase 2: Deep memory scan using Windows API (MeowDoomsdayFucker style)
+                if ($script:MemoryAPILoaded) {
+                    $hProcess = [MemoryScanner]::OpenProcess(
+                        [MemoryScanner]::PROCESS_VM_READ -bor [MemoryScanner]::PROCESS_QUERY_INFORMATION, 
+                        $false, 
+                        $proc.Id
+                    )
+                    
+                    if ($hProcess -ne [IntPtr]::Zero) {
+                        try {
+                            Write-Result "INFO" "Deep scanning PID $($proc.Id) memory regions..."
+                            
+                            $address = [IntPtr]::Zero
+                            $memInfo = New-Object MemoryScanner+MEMORY_BASIC_INFORMATION
+                            $memInfoSize = [System.Runtime.InteropServices.Marshal]::SizeOf($memInfo)
+                            $regionsScanned = 0
+                            $chunkSize = 50 * 1024 * 1024  # 50MB chunks like MeowDoomsdayFucker
+                            $maxRegionSize = 100 * 1024 * 1024  # Skip regions > 100MB
+                            
+                            while ([MemoryScanner]::VirtualQueryEx($hProcess, $address, [ref]$memInfo, $memInfoSize) -ne 0) {
+                                # Check if region is committed and readable
+                                if ($memInfo.State -eq [MemoryScanner]::MEM_COMMIT -and 
+                                    [MemoryScanner]::IsReadableProtection($memInfo.Protect)) {
+                                    
+                                    $regionSize = $memInfo.RegionSize.ToInt64()
+                                    
+                                    # Skip very large regions for performance (like MeowDoomsdayFucker)
+                                    if ($regionSize -lt $maxRegionSize -and $regionSize -gt 0) {
+                                        $buffer = New-Object byte[] ([Math]::Min($regionSize, $chunkSize))
+                                        $bytesRead = 0
+                                        
+                                        if ([MemoryScanner]::ReadProcessMemory($hProcess, $memInfo.BaseAddress, $buffer, $buffer.Length, [ref]$bytesRead)) {
+                                            $regionsScanned++
+                                            
+                                            # Convert buffer to string for pattern matching
+                                            $memString = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead)
+                                            
+                                            foreach ($sig in $doomsdaySignatures) {
+                                                if ($memString.Contains($sig)) {
+                                                    Write-Result "FOUND" "DOOMSDAY IN MEMORY" "$sig (PID: $($proc.Id)) - FUCKED!"
+                                                    $script:SystemFindings += @{
+                                                        Type = "DoomsdayMemory"
+                                                        Description = "Doomsday signature in RAM: $sig"
+                                                        PID = $proc.Id
+                                                        Address = $memInfo.BaseAddress.ToString("X")
+                                                        Severity = "CRITICAL"
+                                                    }
+                                                    $found = $true
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                # Move to next region
+                                $nextAddress = $memInfo.BaseAddress.ToInt64() + $memInfo.RegionSize.ToInt64()
+                                if ($nextAddress -le $address.ToInt64()) { break }
+                                $address = [IntPtr]$nextAddress
+                                
+                                # Safety limit
+                                if ($regionsScanned -gt 1000) { break }
+                            }
+                            
+                            if ($regionsScanned -gt 0) {
+                                Write-Result "INFO" "Scanned $regionsScanned memory regions for PID $($proc.Id)"
+                            }
+                        } finally {
+                            [MemoryScanner]::CloseHandle($hProcess) | Out-Null
+                        }
+                    } else {
+                        Write-Result "WARN" "Cannot access PID $($proc.Id) memory (run as admin)"
+                    }
+                } else {
+                    # Fallback: Module name analysis
+                    try {
+                        $modules = $proc.Modules | ForEach-Object { $_.ModuleName.ToLower() }
+                        foreach ($mod in $modules) {
+                            foreach ($sig in $doomsdaySignatures) {
+                                if ($mod -match $sig.ToLower()) {
+                                    Write-Result "FOUND" "Doomsday module loaded" "$mod (PID: $($proc.Id))"
+                                    $script:SystemFindings += @{
+                                        Type = "DoomsdayModule"
+                                        Description = "Module: $mod"
+                                        PID = $proc.Id
+                                        Severity = "CRITICAL"
+                                    }
+                                    $found = $true
+                                }
+                            }
+                        }
+                    } catch {}
+                }
+            } catch {
+                Write-Verbose "Could not analyze process $($proc.Id): $_"
+            }
         }
     } catch {
         Write-Result "WARN" "Memory analysis requires elevated privileges"
@@ -1089,34 +1250,57 @@ function Check-JavaProcessMemory {
 }
 
 function Check-PrefetchFiles {
-    Write-Section "Windows Prefetch Forensics" "PF"
+    Write-Section "Windows Prefetch Forensics (JAR Parser)" "PF"
     
     $found = $false
     $prefetchPath = "$env:SystemRoot\Prefetch"
     
+    # Extended suspicious patterns for cheat clients
     $suspiciousPatterns = @(
         "DOOMSDAY", "NOVACLIENT", "VAPECLIENT", "RISECLIENT",
         "METEOR", "WURST", "IMPACT", "ARISTOIS", "LIQUIDBOUNCE",
         "SIGMA", "FUTURE", "KONAS", "RUSHERHACK", "PHOBOS",
-        "CHEAT", "HACK", "INJECT", "LOADER", "CLIENT", "GHOST"
+        "SALHACK", "ABYSS", "COSMOS", "THUNDER", "ARES",
+        "CHEAT", "HACK", "INJECT", "LOADER", "CLIENT", "GHOST",
+        "AUTOCLICKER", "GHOSTCLIENT", "VAPE", "NOVA", "INTENT"
+    )
+    
+    # Patterns indicating JAR file execution (like MeowDoomsdayFucker JAR Parser)
+    $jarPatterns = @(
+        "JAVA", "JAVAW", "JAR"
     )
     
     try {
         if (-not (Test-Path $prefetchPath)) {
-            Write-Result "WARN" "Prefetch folder not accessible"
+            Write-Result "WARN" "Prefetch folder not accessible (requires admin)"
             return
         }
         
         $prefetchFiles = Get-ChildItem -Path $prefetchPath -Filter "*.pf" -ErrorAction SilentlyContinue
         
         if ($prefetchFiles.Count -eq 0) {
-            Write-Result "INFO" "No Prefetch files found"
+            Write-Result "INFO" "No Prefetch files found (may be disabled)"
             return
         }
+        
+        Write-Result "INFO" "Analyzing $($prefetchFiles.Count) Prefetch files..."
+        
+        $javaExecutions = @()
         
         foreach ($pf in $prefetchFiles) {
             $name = $pf.BaseName.ToUpper()
             
+            # Track Java executions for timeline
+            foreach ($jarPattern in $jarPatterns) {
+                if ($name -like "*$jarPattern*") {
+                    $javaExecutions += @{
+                        Name = $pf.BaseName
+                        LastRun = $pf.LastWriteTime
+                    }
+                }
+            }
+            
+            # Check for suspicious cheat patterns
             foreach ($pattern in $suspiciousPatterns) {
                 if ($name -match $pattern) {
                     $lastRun = $pf.LastWriteTime
@@ -1132,7 +1316,48 @@ function Check-PrefetchFiles {
                 }
             }
         }
-    } catch {}
+        
+        # Report Java execution timeline
+        if ($javaExecutions.Count -gt 0) {
+            $recentJava = $javaExecutions | Sort-Object -Property LastRun -Descending | Select-Object -First 3
+            foreach ($java in $recentJava) {
+                Write-Result "INFO" "Java execution trace" "$($java.Name) (Last: $($java.LastRun))"
+            }
+        }
+        
+        # Look for recently accessed JAR files in common cheat paths
+        $suspiciousJarPaths = @(
+            "$env:APPDATA\.minecraft\mods",
+            "$env:APPDATA\doomsday",
+            "$env:TEMP"
+        )
+        
+        foreach ($jarPath in $suspiciousJarPaths) {
+            if (Test-Path $jarPath) {
+                $recentJars = Get-ChildItem -Path $jarPath -Filter "*.jar" -ErrorAction SilentlyContinue | 
+                              Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-7) }
+                              
+                foreach ($jar in $recentJars) {
+                    foreach ($pattern in $suspiciousPatterns) {
+                        if ($jar.Name.ToUpper() -match $pattern) {
+                            Write-Result "FOUND" "Suspicious recent JAR file" "$($jar.FullName)"
+                            $script:SystemFindings += @{
+                                Type = "SuspiciousJAR"
+                                Description = "Recent JAR: $($jar.Name)"
+                                Path = $jar.FullName
+                                LastModified = $jar.LastWriteTime
+                                Severity = "HIGH"
+                            }
+                            $found = $true
+                        }
+                    }
+                }
+            }
+        }
+        
+    } catch {
+        Write-Result "WARN" "Prefetch analysis error: $_"
+    }
     
     if (-not $found) {
         Write-Result "CLEAN" "No suspicious Prefetch entries"
@@ -1140,14 +1365,17 @@ function Check-PrefetchFiles {
 }
 
 function Check-DoomsdayRegistry {
-    Write-Section "Doomsday Registry Analysis" "REG"
+    Write-Section "Doomsday Registry & Folder Analysis" "REG"
     
     $found = $false
     
+    # Extended registry keys for Doomsday detection
     $doomsdayKeys = @(
         "HKCU:\Software\Doomsday",
         "HKCU:\Software\DoomsdayClient",
-        "HKLM:\Software\Doomsday"
+        "HKLM:\Software\Doomsday",
+        "HKCU:\Software\DoomsdayMod",
+        "HKCU:\Software\DoomsdayLoader"
     )
     
     foreach ($key in $doomsdayKeys) {
@@ -1162,11 +1390,17 @@ function Check-DoomsdayRegistry {
         }
     }
     
+    # Extended Doomsday folder paths
     $doomsdayPaths = @(
         "$env:APPDATA\Doomsday",
         "$env:APPDATA\.doomsday",
         "$env:LOCALAPPDATA\Doomsday",
-        "$env:APPDATA\doomsdayclient"
+        "$env:APPDATA\doomsdayclient",
+        "$env:APPDATA\DoomsdayClient",
+        "$env:TEMP\Doomsday",
+        "$env:TEMP\doomsday",
+        "$env:USERPROFILE\.doomsday",
+        "$env:APPDATA\.minecraft\doomsday"
     )
     
     foreach ($path in $doomsdayPaths) {
@@ -1176,6 +1410,53 @@ function Check-DoomsdayRegistry {
                 Type = "DoomsdayFolder"
                 Description = "Folder: $path"
                 Severity = "CRITICAL"
+            }
+            $found = $true
+            
+            # List files in Doomsday folder for additional info
+            try {
+                $doomsdayFiles = Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5
+                foreach ($file in $doomsdayFiles) {
+                    Write-Result "INFO" "  Doomsday file" $file.Name
+                }
+            } catch {}
+        }
+    }
+    
+    # Check Recent Files for Doomsday traces (forensic persistence like MeowDoomsdayFucker)
+    $recentPath = "$env:APPDATA\Microsoft\Windows\Recent"
+    if (Test-Path $recentPath) {
+        $recentFiles = Get-ChildItem -Path $recentPath -Filter "*.lnk" -ErrorAction SilentlyContinue
+        foreach ($lnk in $recentFiles) {
+            if ($lnk.Name -match "(?i)doomsday|doom.?client") {
+                Write-Result "FOUND" "Doomsday in Recent Files" $lnk.Name
+                $script:SystemFindings += @{
+                    Type = "DoomsdayRecent"
+                    Description = "Recent file: $($lnk.Name)"
+                    LastAccess = $lnk.LastWriteTime
+                    Severity = "HIGH"
+                }
+                $found = $true
+            }
+        }
+    }
+    
+    # Check for Doomsday config files in common locations
+    $configLocations = @(
+        "$env:APPDATA\.minecraft\config\doomsday*",
+        "$env:APPDATA\.minecraft\*doomsday*",
+        "$env:USERPROFILE\Downloads\*doomsday*"
+    )
+    
+    foreach ($configPattern in $configLocations) {
+        $configFiles = Get-ChildItem -Path $configPattern -ErrorAction SilentlyContinue
+        foreach ($cfg in $configFiles) {
+            Write-Result "FOUND" "Doomsday config/file detected" $cfg.FullName
+            $script:SystemFindings += @{
+                Type = "DoomsdayConfig"
+                Description = "Config: $($cfg.Name)"
+                Path = $cfg.FullName
+                Severity = "HIGH"
             }
             $found = $true
         }
