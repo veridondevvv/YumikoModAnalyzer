@@ -6,7 +6,7 @@
     [switch]$Silent
 )
 $script:Config = @{
-    Version = "4.3.0"
+    Version = "4.4.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
@@ -16,7 +16,7 @@ $script:Config = @{
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods"
+    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -156,6 +156,10 @@ $script:UnknownMods = @()
 $script:CheatMods = @()
 $script:ObfuscatedModsList = @()
 $script:DisallowedModsFound = @()
+$script:ModURLFindings = @()
+$script:BytecodeFindings = @()
+$script:EntropyFindings = @()
+$script:MixinFindings = @()
 function Test-AdminPrivileges {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -1002,8 +1006,8 @@ function Check-JavaProcessMemory {
                             $memInfo = New-Object MemoryScanner+MEMORY_BASIC_INFORMATION
                             $memInfoSize = [System.Runtime.InteropServices.Marshal]::SizeOf($memInfo)
                             $regionsScanned = 0
-                            $chunkSize = 50 * 1024 * 1024  # 50MB chunks like MeowDoomsdayFucker
-                            $maxRegionSize = 100 * 1024 * 1024  # Skip regions > 100MB
+                            $chunkSize = 100 * 1024 * 1024  # 100MB chunks for thorough scanning
+                            $maxRegionSize = 256 * 1024 * 1024  # Scan regions up to 256MB
                             while ([MemoryScanner]::VirtualQueryEx($hProcess, $address, [ref]$memInfo, $memInfoSize) -ne 0) {
                                 if ($memInfo.State -eq [MemoryScanner]::MEM_COMMIT -and 
                                     [MemoryScanner]::IsReadableProtection($memInfo.Protect)) {
@@ -1033,7 +1037,7 @@ function Check-JavaProcessMemory {
                                 $nextAddress = $memInfo.BaseAddress.ToInt64() + $memInfo.RegionSize.ToInt64()
                                 if ($nextAddress -le $address.ToInt64()) { break }
                                 $address = [IntPtr]$nextAddress
-                                if ($regionsScanned -gt 1000) { break }
+                                if ($regionsScanned -gt 5000) { break }
                             }
                             if ($regionsScanned -gt 0) {
                                 Write-Result "INFO" "Scanned $regionsScanned memory regions for PID $($proc.Id)"
@@ -1089,7 +1093,7 @@ function Check-LocalhostWebServer {
         Write-Result "INFO" "Found $($javaPids.Count) Java process(es) - scanning their ports..."
         $listeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
                      Where-Object { 
-                         ($_.LocalAddress -eq "127.0.0.1" -or $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::") -and
+                         ($_.LocalAddress -eq "127.0.0.1" -or $_.LocalAddress -eq "0.0.0.0" -or $_.LocalAddress -eq "::" -or $_.LocalAddress -eq "::1") -and
                          ($javaPids -contains $_.OwningProcess)
                      } |
                      Sort-Object LocalPort
@@ -1097,8 +1101,10 @@ function Check-LocalhostWebServer {
             Write-Result "CLEAN" "Java processes not listening on localhost"
             return
         }
+        $foundServer = $false
         foreach ($listener in $listeners) {
             $port = $listener.LocalPort
+            $bindAddr = $listener.LocalAddress
             $ownerPid = $listener.OwningProcess
             $processName = "Unknown"
             $processPath = ""
@@ -1112,36 +1118,89 @@ function Check-LocalhostWebServer {
             $isWebServer = $false
             $httpStatus = ""
             $serverHeader = ""
-            try {
-                $webRequest = [System.Net.WebRequest]::Create("http://127.0.0.1:$port/")
-                $webRequest.Timeout = 1500
-                $webRequest.Method = "HEAD"
+            $detectionMethod = ""
+            # Probe HTTP on both 127.0.0.1 and the actual bind address
+            $probeAddresses = @("127.0.0.1")
+            if ($bindAddr -eq "0.0.0.0") { $probeAddresses += "0.0.0.0" }
+            foreach ($probeAddr in $probeAddresses) {
+                if ($isWebServer) { break }
                 try {
-                    $response = $webRequest.GetResponse()
-                    $httpStatus = "HTTP $([int]$response.StatusCode)"
-                    $serverHeader = $response.Headers["Server"]
-                    $response.Close()
-                    $isWebServer = $true
-                } catch [System.Net.WebException] {
-                    $errorResponse = $_.Exception.Response
-                    if ($null -ne $errorResponse) {
-                        $httpStatus = "HTTP $([int]$errorResponse.StatusCode)"
-                        $serverHeader = $errorResponse.Headers["Server"]
+                    $webRequest = [System.Net.WebRequest]::Create("http://${probeAddr}:$port/")
+                    $webRequest.Timeout = 1500
+                    $webRequest.Method = "HEAD"
+                    try {
+                        $response = $webRequest.GetResponse()
+                        $httpStatus = "HTTP $([int]$response.StatusCode)"
+                        $serverHeader = $response.Headers["Server"]
+                        $response.Close()
                         $isWebServer = $true
+                        $detectionMethod = "HTTP HEAD"
+                    } catch [System.Net.WebException] {
+                        $errorResponse = $_.Exception.Response
+                        if ($null -ne $errorResponse) {
+                            $httpStatus = "HTTP $([int]$errorResponse.StatusCode)"
+                            $serverHeader = $errorResponse.Headers["Server"]
+                            $isWebServer = $true
+                            $detectionMethod = "HTTP HEAD (error response)"
+                        }
                     }
-                }
-            } catch {}
+                } catch {}
+            }
+            # If HEAD failed, try GET (some WS servers respond to GET with upgrade headers)
+            if (-not $isWebServer) {
+                try {
+                    $webRequest = [System.Net.WebRequest]::Create("http://127.0.0.1:$port/")
+                    $webRequest.Timeout = 1500
+                    $webRequest.Method = "GET"
+                    try {
+                        $response = $webRequest.GetResponse()
+                        $httpStatus = "HTTP $([int]$response.StatusCode)"
+                        $serverHeader = $response.Headers["Server"]
+                        $upgradeHeader = $response.Headers["Upgrade"]
+                        $response.Close()
+                        $isWebServer = $true
+                        $detectionMethod = if ($upgradeHeader -match "(?i)websocket") { "WebSocket endpoint" } else { "HTTP GET" }
+                    } catch [System.Net.WebException] {
+                        $errorResponse = $_.Exception.Response
+                        if ($null -ne $errorResponse) {
+                            $httpStatus = "HTTP $([int]$errorResponse.StatusCode)"
+                            $serverHeader = $errorResponse.Headers["Server"]
+                            $isWebServer = $true
+                            $detectionMethod = "HTTP GET (error response)"
+                        }
+                    }
+                } catch {}
+            }
+            # TCP connect test: if HTTP probes all failed, at least verify the port accepts connections
+            if (-not $isWebServer) {
+                try {
+                    $tcp = New-Object System.Net.Sockets.TcpClient
+                    $connectResult = $tcp.BeginConnect("127.0.0.1", $port, $null, $null)
+                    $connected = $connectResult.AsyncWaitHandle.WaitOne(1000)
+                    if ($connected -and $tcp.Connected) {
+                        $isWebServer = $true
+                        $httpStatus = "TCP OPEN"
+                        $detectionMethod = "TCP connect (non-HTTP)"
+                    }
+                    $tcp.Close()
+                } catch {}
+            }
             if ($isWebServer) {
+                $bindInfo = if ($bindAddr -eq "0.0.0.0") { " [BOUND TO ALL INTERFACES!]" } else { "" }
                 $serverInfo = if ($serverHeader) { " Server: $serverHeader" } else { "" }
-                Write-Result "FOUND" "WEB SERVER localhost:$port [JAVA!]" "$processName (PID $ownerPid) - $httpStatus$serverInfo"
-                Write-Result "WARN" "  SUSPICIOUS: Java hosting web server - possible Cheat GUI!"
+                Write-Result "FOUND" "WEB SERVER localhost:$port [JAVA!]$bindInfo" "$processName (PID $ownerPid) - $httpStatus$serverInfo"
+                Write-Result "WARN" "  SUSPICIOUS: Java hosting web server - possible Cheat GUI! ($detectionMethod)"
+                if ($bindAddr -eq "0.0.0.0") {
+                    Write-Result "WARN" "  CRITICAL: Bound to 0.0.0.0 - accessible from network!"
+                }
                 if ($processPath) {
                     Write-Result "INFO" "  Path: $processPath"
                 }
                 $script:SystemFindings += @{
                     Type = "LocalhostWebServer"
-                    Description = "Java web server on port $port"
+                    Description = "Java web server on port $port ($detectionMethod)"
                     Port = $port
+                    BindAddress = $bindAddr
                     Process = $processName
                     ProcessPath = $processPath
                     IsJava = $true
@@ -1150,10 +1209,12 @@ function Check-LocalhostWebServer {
                     Server = $serverHeader
                     Severity = "CRITICAL"
                 }
-                return
+                $foundServer = $true
             }
         }
-        Write-Result "CLEAN" "Java ports checked - no web servers"
+        if (-not $foundServer) {
+            Write-Result "CLEAN" "Java ports checked - no web servers"
+        }
     } catch {
         Write-Result "WARN" "Could not enumerate network connections: $_"
     }
@@ -2113,24 +2174,446 @@ function Test-MegabaseHash {
     } catch {}
     return $null
 }
-function Test-CheatStrings {
+function Test-JarURLsAndDomains {
     param([string]$FilePath)
-    $foundStrings = [System.Collections.Generic.HashSet[string]]::new()
+    $findings = @{
+        URLs = [System.Collections.Generic.HashSet[string]]::new()
+        Domains = [System.Collections.Generic.HashSet[string]]::new()
+        IPs = [System.Collections.Generic.HashSet[string]]::new()
+    }
+    # Known safe domains to filter out (common in legitimate mods)
+    $safeDomains = @(
+        "minecraft.net", "mojang.com", "minecraftforge.net", "fabricmc.net",
+        "modrinth.com", "curseforge.com", "github.com", "githubusercontent.com",
+        "gradle.org", "maven.org", "apache.org", "google.com", "googleapis.com",
+        "oracle.com", "java.net", "java.com", "sun.com", "jetbrains.com",
+        "w3.org", "xml.org", "schema.org", "json-schema.org", "xmlsoap.org",
+        "xmlns.com", "purl.org", "semver.org", "spdx.org", "slf4j.org",
+        "lwjgl.org", "ow2.io", "objectweb.org", "opengl.org", "khronos.org",
+        "neoforged.net", "quiltmc.org", "spongepowered.org", "spongepowered.com",
+        "mumfrey.liteloader.org", "liteloader.com"
+    )
+    $urlPattern = '(https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&''()*+,;=%]{4,200})'
+    $domainPattern = '(?:https?://)?([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,})'
+    $ipPattern = '((?:https?://)?(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?:/[^\s]*)?)'
     try {
         $bytes = [System.IO.File]::ReadAllBytes($FilePath)
         $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+        # Extract URLs
+        $urlMatches = [regex]::Matches($content, $urlPattern)
+        foreach ($match in $urlMatches) {
+            $url = $match.Groups[1].Value
+            # Filter out safe/common URLs
+            $isSafe = $false
+            foreach ($safe in $safeDomains) {
+                if ($url -match [regex]::Escape($safe)) { $isSafe = $true; break }
+            }
+            if (-not $isSafe) {
+                $findings.URLs.Add($url) | Out-Null
+            }
+        }
+        # Extract domains from URLs
+        $domainMatches = [regex]::Matches($content, $domainPattern)
+        foreach ($match in $domainMatches) {
+            $domain = $match.Groups[1].Value.ToLower()
+            if ($domain.Length -gt 4 -and $domain -match '\.') {
+                $isSafe = $false
+                foreach ($safe in $safeDomains) {
+                    if ($domain -match [regex]::Escape($safe)) { $isSafe = $true; break }
+                }
+                if (-not $isSafe -and $domain -notmatch '^\d+\.\d+\.\d+' -and $domain -notmatch '\.class$' -and $domain -notmatch '\.json$' -and $domain -notmatch '\.jar$' -and $domain -notmatch '\.png$' -and $domain -notmatch '\.txt$' -and $domain -notmatch '\.cfg$' -and $domain -notmatch '\.toml$' -and $domain -notmatch '\.properties$') {
+                    $findings.Domains.Add($domain) | Out-Null
+                }
+            }
+        }
+        # Extract IP addresses
+        $ipMatches = [regex]::Matches($content, $ipPattern)
+        foreach ($match in $ipMatches) {
+            $ip = $match.Groups[1].Value
+            # Filter out localhost and common safe IPs
+            if ($ip -notmatch '^(https?://)?127\.0\.0\.1' -and $ip -notmatch '^(https?://)?0\.0\.0\.0' -and $ip -notmatch '^(https?://)?10\.' -and $ip -notmatch '^(https?://)?192\.168\.' -and $ip -notmatch '^(https?://)?255\.') {
+                $findings.IPs.Add($ip) | Out-Null
+            }
+        }
+        # Also scan individual class/json entries for more precise results
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $entries = $zip.Entries | Where-Object { $_.Name -match '\.(class|json|properties|cfg|yml|yaml|txt)$' }
+        foreach ($entry in $entries) {
+            try {
+                $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+                $entryContent = $reader.ReadToEnd()
+                $reader.Close()
+                $entryUrlMatches = [regex]::Matches($entryContent, $urlPattern)
+                foreach ($match in $entryUrlMatches) {
+                    $url = $match.Groups[1].Value
+                    $isSafe = $false
+                    foreach ($safe in $safeDomains) {
+                        if ($url -match [regex]::Escape($safe)) { $isSafe = $true; break }
+                    }
+                    if (-not $isSafe) {
+                        $findings.URLs.Add($url) | Out-Null
+                    }
+                }
+                $entryIpMatches = [regex]::Matches($entryContent, $ipPattern)
+                foreach ($match in $entryIpMatches) {
+                    $ip = $match.Groups[1].Value
+                    if ($ip -notmatch '^(https?://)?127\.0\.0\.1' -and $ip -notmatch '^(https?://)?0\.0\.0\.0' -and $ip -notmatch '^(https?://)?10\.' -and $ip -notmatch '^(https?://)?192\.168\.' -and $ip -notmatch '^(https?://)?255\.') {
+                        $findings.IPs.Add($ip) | Out-Null
+                    }
+                }
+            } catch {}
+        }
+        $zip.Dispose()
+    } catch {}
+    return $findings
+}
+function Test-BytecodePatterns {
+    param([string]$FilePath)
+    $findings = @{
+        Reflection = @()
+        DynamicLoading = @()
+        Networking = @()
+        NativeAccess = @()
+        Score = 0
+    }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 100 -and $_.Length -lt 500000 }
+        $scanned = 0
+        $reflectionPatterns = @(
+            "java/lang/reflect/Method", "java/lang/reflect/Field", "java/lang/reflect/Constructor",
+            "java/lang/Class;->forName", "java.lang.reflect.Proxy", "java/lang/invoke/MethodHandle",
+            "java/lang/invoke/MethodHandles", "getDeclaredMethod", "getDeclaredField",
+            "setAccessible", "invoke(Ljava/lang/Object"
+        )
+        $dynamicLoadPatterns = @(
+            "java/lang/ClassLoader;->defineClass", "java/net/URLClassLoader",
+            "java/security/SecureClassLoader", "java/lang/ClassLoader;->loadClass",
+            "java/lang/ClassLoader;->findClass", "sun/misc/Unsafe",
+            "java/lang/instrument/Instrumentation", "java/lang/instrument/ClassFileTransformer",
+            "jdk/internal/misc/Unsafe", "java.lang.ClassLoader", "defineClass0",
+            "java/lang/Runtime;->exec", "ProcessBuilder"
+        )
+        $networkPatterns = @(
+            "java/net/Socket;-><init>", "java/net/HttpURLConnection",
+            "java/net/URL;->openConnection", "java/net/URL;->openStream",
+            "javax/net/ssl/HttpsURLConnection", "java/net/DatagramSocket",
+            "java/net/ServerSocket;-><init>", "java/nio/channels/SocketChannel",
+            "okhttp3/OkHttpClient", "okhttp3/Request", "org/apache/http",
+            "discord.com/api/webhooks", "webhook", "hwid", "license"
+        )
+        $nativePatterns = @(
+            "java/lang/System;->loadLibrary", "java/lang/System;->load(",
+            "java/lang/Runtime;->loadLibrary", "JNI_OnLoad",
+            "sun/misc/Unsafe;->allocateMemory", "sun/misc/Unsafe;->putInt",
+            "sun/misc/Unsafe;->getObject", "sun/misc/Unsafe;->putObject"
+        )
+        foreach ($entry in $classEntries) {
+            if ($scanned -ge 200) { break }
+            try {
+                $stream = $entry.Open()
+                $ms = New-Object System.IO.MemoryStream
+                $stream.CopyTo($ms)
+                $stream.Close()
+                $bytes = $ms.ToArray()
+                $ms.Dispose()
+                $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+                $className = $entry.FullName -replace '\.class$', ''
+                foreach ($p in $reflectionPatterns) {
+                    if ($content.Contains($p)) {
+                        $findings.Reflection += "$className -> $p"
+                        break
+                    }
+                }
+                foreach ($p in $dynamicLoadPatterns) {
+                    if ($content.Contains($p)) {
+                        $findings.DynamicLoading += "$className -> $p"
+                        break
+                    }
+                }
+                foreach ($p in $networkPatterns) {
+                    if ($content.Contains($p)) {
+                        $findings.Networking += "$className -> $p"
+                        break
+                    }
+                }
+                foreach ($p in $nativePatterns) {
+                    if ($content.Contains($p)) {
+                        $findings.NativeAccess += "$className -> $p"
+                        break
+                    }
+                }
+                $scanned++
+            } catch {}
+        }
+        $zip.Dispose()
+        # Score: many reflection + dynamic loading + native = very suspicious
+        if ($findings.Reflection.Count -gt 10) { $findings.Score += 15 }
+        elseif ($findings.Reflection.Count -gt 5) { $findings.Score += 8 }
+        if ($findings.DynamicLoading.Count -gt 3) { $findings.Score += 25 }
+        elseif ($findings.DynamicLoading.Count -gt 0) { $findings.Score += 12 }
+        if ($findings.Networking.Count -gt 5) { $findings.Score += 20 }
+        elseif ($findings.Networking.Count -gt 2) { $findings.Score += 10 }
+        if ($findings.NativeAccess.Count -gt 2) { $findings.Score += 25 }
+        elseif ($findings.NativeAccess.Count -gt 0) { $findings.Score += 15 }
+        # Combination bonus: reflection + dynamic loading = classic cheat pattern
+        if ($findings.Reflection.Count -gt 3 -and $findings.DynamicLoading.Count -gt 0) {
+            $findings.Score += 15
+        }
+        # Native + networking = very likely loader/injector
+        if ($findings.NativeAccess.Count -gt 0 -and $findings.Networking.Count -gt 0) {
+            $findings.Score += 15
+        }
+    } catch {}
+    return $findings
+}
+function Test-ClassEntropy {
+    param([string]$FilePath)
+    $findings = @{
+        HighEntropyClasses = @()
+        AverageEntropy = 0.0
+        MaxEntropy = 0.0
+        Score = 0
+    }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 500 -and $_.Length -lt 500000 }
+        $entropyValues = @()
+        $scanned = 0
+        foreach ($entry in $classEntries) {
+            if ($scanned -ge 150) { break }
+            try {
+                $stream = $entry.Open()
+                $ms = New-Object System.IO.MemoryStream
+                $stream.CopyTo($ms)
+                $stream.Close()
+                $bytes = $ms.ToArray()
+                $ms.Dispose()
+                # Calculate Shannon entropy on the string constant pool area
+                # Skip first 10 bytes (magic + version), focus on constant pool strings
+                if ($bytes.Length -gt 100) {
+                    $sampleStart = [math]::Min(10, $bytes.Length - 1)
+                    $sampleLen = [math]::Min(4096, $bytes.Length - $sampleStart)
+                    $sample = New-Object byte[] $sampleLen
+                    [Array]::Copy($bytes, $sampleStart, $sample, 0, $sampleLen)
+                    $freq = @{}
+                    foreach ($b in $sample) {
+                        if ($freq.ContainsKey($b)) { $freq[$b]++ } else { $freq[$b] = 1 }
+                    }
+                    $entropy = 0.0
+                    $len = $sample.Length
+                    foreach ($count in $freq.Values) {
+                        $p = $count / $len
+                        if ($p -gt 0) { $entropy -= $p * [math]::Log($p, 2) }
+                    }
+                    $entropyValues += $entropy
+                    if ($entropy -gt 7.2) {
+                        $findings.HighEntropyClasses += @{
+                            Class = $entry.FullName -replace '\.class$', ''
+                            Entropy = [math]::Round($entropy, 3)
+                            Size = $entry.Length
+                        }
+                    }
+                    if ($entropy -gt $findings.MaxEntropy) { $findings.MaxEntropy = $entropy }
+                }
+                $scanned++
+            } catch {}
+        }
+        $zip.Dispose()
+        if ($entropyValues.Count -gt 0) {
+            $findings.AverageEntropy = [math]::Round(($entropyValues | Measure-Object -Average).Average, 3)
+        }
+        # Score based on high-entropy class percentage
+        $highEntropyPct = if ($scanned -gt 0) { ($findings.HighEntropyClasses.Count / $scanned) * 100 } else { 0 }
+        if ($highEntropyPct -gt 50) { $findings.Score += 30 }
+        elseif ($highEntropyPct -gt 25) { $findings.Score += 20 }
+        elseif ($highEntropyPct -gt 10) { $findings.Score += 10 }
+        if ($findings.MaxEntropy -gt 7.5) { $findings.Score += 15 }
+        if ($findings.AverageEntropy -gt 6.5) { $findings.Score += 10 }
+    } catch {}
+    return $findings
+}
+function Test-MixinConfigs {
+    param([string]$FilePath)
+    $findings = @{
+        SuspiciousTargets = @()
+        MixinConfigs = @()
+        Score = 0
+    }
+    # Minecraft classes commonly targeted by cheat mixins
+    $suspiciousTargets = @(
+        # Combat
+        "ClientPlayerInteractionManager", "PlayerEntity", "LivingEntity",
+        "ClientPlayerEntity", "PlayerInventory", "ItemCooldownManager",
+        "GameRenderer", "Camera", "WorldRenderer",
+        # Movement
+        "Entity", "ClientPlayerEntity", "AbstractClientPlayerEntity",
+        "FluidState", "Block", "VoxelShape",
+        # Network/Packets
+        "ClientConnection", "ClientPlayNetworkHandler", "NetworkState",
+        "PacketByteBuf", "CustomPayloadC2SPacket", "CustomPayloadS2CPacket",
+        # Rendering/ESP
+        "InGameHud", "WorldRenderer", "BufferBuilder",
+        "EntityRenderDispatcher", "BlockEntityRenderDispatcher",
+        # Input
+        "KeyboardInput", "Mouse", "MinecraftClient",
+        # Inventory
+        "HandledScreen", "GenericContainerScreen", "CreativeInventoryScreen"
+    )
+    $suspiciousTargetsLower = $suspiciousTargets | ForEach-Object { $_.ToLower() } | Sort-Object -Unique
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $mixinEntries = $zip.Entries | Where-Object { $_.Name -match '\.mixins\.json$|mixin\.json$|mixins\..*\.json$' }
+        foreach ($entry in $mixinEntries) {
+            try {
+                $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+                $json = $content | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($null -eq $json) { continue }
+                $configInfo = @{
+                    File = $entry.FullName
+                    Package = ""
+                    Targets = @()
+                }
+                if ($json.package) { $configInfo.Package = $json.package }
+                $allMixinClasses = @()
+                if ($json.client) { $allMixinClasses += @($json.client) }
+                if ($json.server) { $allMixinClasses += @($json.server) }
+                if ($json.mixins) { $allMixinClasses += @($json.mixins) }
+                foreach ($mixinClass in $allMixinClasses) {
+                    $classLower = $mixinClass.ToString().ToLower()
+                    foreach ($target in $suspiciousTargetsLower) {
+                        if ($classLower -match [regex]::Escape($target)) {
+                            $configInfo.Targets += $mixinClass
+                            $findings.SuspiciousTargets += "$($entry.FullName): $mixinClass"
+                            break
+                        }
+                    }
+                }
+                $findings.MixinConfigs += $configInfo
+            } catch {}
+        }
+        $zip.Dispose()
+        # Score: many suspicious mixin targets = likely cheat
+        $targetCount = $findings.SuspiciousTargets.Count
+        if ($targetCount -gt 15) { $findings.Score += 30 }
+        elseif ($targetCount -gt 8) { $findings.Score += 20 }
+        elseif ($targetCount -gt 4) { $findings.Score += 10 }
+        elseif ($targetCount -gt 0) { $findings.Score += 5 }
+        # Targeting combat + movement + rendering together = classic cheat pattern
+        $hasCombat = $findings.SuspiciousTargets | Where-Object { $_ -match "(?i)(PlayerInteraction|LivingEntity|ItemCooldown|PlayerEntity)" }
+        $hasMovement = $findings.SuspiciousTargets | Where-Object { $_ -match "(?i)(Entity|FluidState|KeyboardInput)" }
+        $hasRendering = $findings.SuspiciousTargets | Where-Object { $_ -match "(?i)(WorldRenderer|InGameHud|EntityRenderDispatcher|GameRenderer)" }
+        $hasNetwork = $findings.SuspiciousTargets | Where-Object { $_ -match "(?i)(ClientConnection|NetworkHandler|PacketByteBuf)" }
+        $categoryCount = 0
+        if ($hasCombat) { $categoryCount++ }
+        if ($hasMovement) { $categoryCount++ }
+        if ($hasRendering) { $categoryCount++ }
+        if ($hasNetwork) { $categoryCount++ }
+        if ($categoryCount -ge 3) { $findings.Score += 20 }
+        elseif ($categoryCount -ge 2) { $findings.Score += 10 }
+    } catch {}
+    return $findings
+}
+function Test-ManifestSuspicious {
+    param([string]$FilePath)
+    $findings = @{
+        Suspicious = @()
+        Score = 0
+    }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $manifest = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" } | Select-Object -First 1
+        if ($manifest) {
+            $reader = New-Object System.IO.StreamReader($manifest.Open(), [System.Text.Encoding]::UTF8)
+            $content = $reader.ReadToEnd()
+            $reader.Close()
+            if ($content -match "(?i)Premain-Class:") {
+                $findings.Suspicious += "Premain-Class detected (Java Agent injection)"
+                $findings.Score += 25
+            }
+            if ($content -match "(?i)Agent-Class:") {
+                $findings.Suspicious += "Agent-Class detected (Java Agent injection)"
+                $findings.Score += 25
+            }
+            if ($content -match "(?i)Can-Redefine-Classes:\s*true") {
+                $findings.Suspicious += "Can-Redefine-Classes: true (runtime class modification)"
+                $findings.Score += 15
+            }
+            if ($content -match "(?i)Can-Retransform-Classes:\s*true") {
+                $findings.Suspicious += "Can-Retransform-Classes: true (runtime class modification)"
+                $findings.Score += 15
+            }
+            if ($content -match "(?i)Boot-Class-Path:") {
+                $findings.Suspicious += "Boot-Class-Path detected (bootclasspath injection)"
+                $findings.Score += 20
+            }
+        }
+        $zip.Dispose()
+    } catch {}
+    return $findings
+}
+function Test-CheatStrings {
+    param([string]$FilePath)
+    $foundStrings = [System.Collections.Generic.HashSet[string]]::new()
+    $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
+    # Helper: scan content for cheat strings and fullwidth unicode
+    function Scan-ContentForCheats {
+        param([string]$Content, [bool]$LowerCase = $false)
+        $searchContent = if ($LowerCase) { $Content } else { $Content }
         foreach ($cheatString in $script:CheatStrings) {
-            if ($content -match [regex]::Escape($cheatString)) {
+            $searchStr = if ($LowerCase) { $cheatString.ToLower() } else { $cheatString }
+            if ($searchContent -match [regex]::Escape($searchStr)) {
                 $foundStrings.Add($cheatString) | Out-Null
             }
         }
-        $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
-        if ($content -match $fullwidthPattern) {
-            $fullwidthMatches = [regex]::Matches($content, $fullwidthPattern)
-            foreach ($match in $fullwidthMatches) {
-                $foundStrings.Add("FULLWIDTH_UNICODE: $($match.Value)") | Out-Null
+        if ($searchContent -match $fullwidthPattern) {
+            $fwMatches = [regex]::Matches($searchContent, $fullwidthPattern)
+            foreach ($m in $fwMatches) {
+                $foundStrings.Add("FULLWIDTH_UNICODE: $($m.Value)") | Out-Null
             }
         }
+    }
+    # Helper: recursively scan nested JARs up to maxDepth
+    function Scan-NestedJar {
+        param([System.IO.Stream]$JarStream, [int]$Depth = 0, [int]$MaxDepth = 3)
+        if ($Depth -gt $MaxDepth) { return }
+        try {
+            $archive = New-Object System.IO.Compression.ZipArchive($JarStream, [System.IO.Compression.ZipArchiveMode]::Read)
+            foreach ($entry in $archive.Entries) {
+                if ($entry.Name -like "*.jar" -and $Depth -lt $MaxDepth) {
+                    try {
+                        $ms = New-Object System.IO.MemoryStream
+                        $entryStream = $entry.Open()
+                        $entryStream.CopyTo($ms)
+                        $entryStream.Close()
+                        $ms.Position = 0
+                        Scan-NestedJar -JarStream $ms -Depth ($Depth + 1) -MaxDepth $MaxDepth
+                        $ms.Dispose()
+                    } catch {}
+                    continue
+                }
+                if ($entry.Name -match '\.(class|json)$') {
+                    try {
+                        $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+                        $nestedContent = $reader.ReadToEnd().ToLower()
+                        $reader.Close()
+                        Scan-ContentForCheats -Content $nestedContent -LowerCase $true
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
+        $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+        Scan-ContentForCheats -Content $content
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
         $entries = $zip.Entries | Where-Object { $_.Name -match '\.(class|json|jar)$' }
@@ -2138,21 +2621,12 @@ function Test-CheatStrings {
             if ($entry.Name -like "*.jar") {
                 try {
                     $ms = New-Object System.IO.MemoryStream
-                    $entry.Open().CopyTo($ms)
+                    $entryStream = $entry.Open()
+                    $entryStream.CopyTo($ms)
+                    $entryStream.Close()
                     $ms.Position = 0
-                    $nestedZip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read)
-                    foreach ($nestedEntry in $nestedZip.Entries) {
-                        if ($nestedEntry.Name -match '\.(class|json)$') {
-                            $reader = New-Object System.IO.StreamReader($nestedEntry.Open(), [System.Text.Encoding]::UTF8)
-                            $nestedContent = $reader.ReadToEnd().ToLower()
-                            $reader.Close()
-                            foreach ($string in $script:CheatStrings) {
-                                if ($nestedContent -match [regex]::Escape($string.ToLower())) {
-                                    $foundStrings.Add($string) | Out-Null
-                                }
-                            }
-                        }
-                    }
+                    Scan-NestedJar -JarStream $ms -Depth 1 -MaxDepth 3
+                    $ms.Dispose()
                 } catch {}
                 continue
             }
@@ -2160,18 +2634,7 @@ function Test-CheatStrings {
                 $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
                 $entryContent = $reader.ReadToEnd()
                 $reader.Close()
-                foreach ($string in $script:CheatStrings) {
-                    if ($entryContent -match [regex]::Escape($string)) {
-                        $foundStrings.Add($string) | Out-Null
-                    }
-                }
-                $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
-                if ($entryContent -match $fullwidthPattern) {
-                    $matches = [regex]::Matches($entryContent, $fullwidthPattern)
-                    foreach ($match in $matches) {
-                        $foundStrings.Add("FULLWIDTH_UNICODE: $($match.Value)") | Out-Null
-                    }
-                }
+                Scan-ContentForCheats -Content $entryContent
             } catch {}
         }
         $zip.Dispose()
@@ -2273,6 +2736,17 @@ function Analyze-ModsFolder {
                 Detected = $obfResult.Detected
             }
         }
+        # Scan for URLs, domains, and IPs
+        $urlFindings = Test-JarURLsAndDomains -FilePath $file.FullName
+        if ($urlFindings.URLs.Count -gt 0 -or $urlFindings.IPs.Count -gt 0) {
+            $script:ModURLFindings += @{
+                FileName = $file.Name
+                FilePath = $file.FullName
+                URLs = @($urlFindings.URLs)
+                Domains = @($urlFindings.Domains)
+                IPs = @($urlFindings.IPs)
+            }
+        }
         $modrinthResult = Test-ModrinthHash -Hash $hash
         if ($modrinthResult) {
             $script:VerifiedMods += @{
@@ -2308,6 +2782,57 @@ function Analyze-ModsFolder {
             }
             continue
         }
+        # Advanced detection: Bytecode, Entropy, Mixin, Manifest analysis
+        $bytecodeResult = Test-BytecodePatterns -FilePath $file.FullName
+        $entropyResult = Test-ClassEntropy -FilePath $file.FullName
+        $mixinResult = Test-MixinConfigs -FilePath $file.FullName
+        $manifestResult = Test-ManifestSuspicious -FilePath $file.FullName
+        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score
+        # Track findings for reporting
+        if ($bytecodeResult.Score -gt 0 -or $entropyResult.Score -gt 0 -or $mixinResult.Score -gt 0 -or $manifestResult.Score -gt 0) {
+            $script:BytecodeFindings += @{
+                FileName = $file.Name
+                BytecodeScore = $bytecodeResult.Score
+                EntropyScore = $entropyResult.Score
+                MixinScore = $mixinResult.Score
+                ManifestScore = $manifestResult.Score
+                TotalAdvancedScore = $advancedScore
+                Bytecode = $bytecodeResult
+                Entropy = $entropyResult
+                Mixin = $mixinResult
+                Manifest = $manifestResult
+            }
+        }
+        # If advanced analysis flags this mod as highly suspicious, mark as cheat
+        if ($advancedScore -ge 50) {
+            $advancedReasons = @()
+            if ($bytecodeResult.Score -gt 0) {
+                $details = @()
+                if ($bytecodeResult.Reflection.Count -gt 0) { $details += "Reflection($($bytecodeResult.Reflection.Count))" }
+                if ($bytecodeResult.DynamicLoading.Count -gt 0) { $details += "DynLoad($($bytecodeResult.DynamicLoading.Count))" }
+                if ($bytecodeResult.Networking.Count -gt 0) { $details += "Network($($bytecodeResult.Networking.Count))" }
+                if ($bytecodeResult.NativeAccess.Count -gt 0) { $details += "Native($($bytecodeResult.NativeAccess.Count))" }
+                $advancedReasons += "BYTECODE ANALYSIS (Score: $($bytecodeResult.Score)): $($details -join ', ')"
+            }
+            if ($entropyResult.Score -gt 0) {
+                $advancedReasons += "HIGH ENTROPY (Score: $($entropyResult.Score)): $($entropyResult.HighEntropyClasses.Count) encrypted classes, Avg: $($entropyResult.AverageEntropy), Max: $($entropyResult.MaxEntropy)"
+            }
+            if ($mixinResult.Score -gt 0) {
+                $advancedReasons += "SUSPICIOUS MIXINS (Score: $($mixinResult.Score)): $($mixinResult.SuspiciousTargets.Count) combat/movement/render targets"
+            }
+            if ($manifestResult.Score -gt 0) {
+                $advancedReasons += "MANIFEST FLAGS (Score: $($manifestResult.Score)): $($manifestResult.Suspicious -join ', ')"
+            }
+            $script:CheatMods += @{
+                FileName = $file.Name
+                FilePath = $file.FullName
+                StringsFound = $advancedReasons
+                InDependency = $false
+                IsObfuscated = $isObfuscated
+                ObfuscatorInfo = $obfResult
+            }
+            continue
+        }
         $downloadSource = Get-ZoneIdentifier -FilePath $file.FullName
         $script:UnknownMods += @{
             FileName = $file.Name
@@ -2316,12 +2841,19 @@ function Analyze-ModsFolder {
             Hash = $hash
             IsObfuscated = $isObfuscated
             ObfuscatorInfo = $obfResult
+            AdvancedScore = $advancedScore
+            BytecodeInfo = $bytecodeResult
+            EntropyInfo = $entropyResult
+            MixinInfo = $mixinResult
+            ManifestInfo = $manifestResult
         }
     }
     $toMoveToCheat = @()
     foreach ($mod in $script:UnknownMods) {
         $hasCritical = ($mod.ObfuscatorInfo.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
-        if (($mod.IsObfuscated -and $mod.ObfuscatorInfo.Score -gt 80) -or $hasCritical) {
+        $advScore = if ($mod.AdvancedScore) { $mod.AdvancedScore } else { 0 }
+        # Move to cheat if: heavy obfuscation OR critical obfuscator OR obfuscated + high advanced score
+        if (($mod.IsObfuscated -and $mod.ObfuscatorInfo.Score -gt 80) -or $hasCritical -or ($mod.IsObfuscated -and $advScore -ge 30)) {
             $reasons = @("HEAVY OBFUSCATION (Score: $($mod.ObfuscatorInfo.Score)%)")
             if ($hasCritical) {
                 $critObf = ($mod.ObfuscatorInfo.Detected | Where-Object { $_.Severity -eq "CRITICAL" } | Select-Object -First 1).Name
@@ -2329,6 +2861,14 @@ function Analyze-ModsFolder {
             }
             if ($mod.ObfuscatorInfo.Indicators.Count -gt 0) {
                 $reasons += $mod.ObfuscatorInfo.Indicators | Select-Object -First 3
+            }
+            if ($advScore -gt 0) {
+                $advDetails = @()
+                if ($mod.BytecodeInfo -and $mod.BytecodeInfo.Score -gt 0) { $advDetails += "Bytecode:$($mod.BytecodeInfo.Score)" }
+                if ($mod.EntropyInfo -and $mod.EntropyInfo.Score -gt 0) { $advDetails += "Entropy:$($mod.EntropyInfo.Score)" }
+                if ($mod.MixinInfo -and $mod.MixinInfo.Score -gt 0) { $advDetails += "Mixin:$($mod.MixinInfo.Score)" }
+                if ($mod.ManifestInfo -and $mod.ManifestInfo.Score -gt 0) { $advDetails += "Manifest:$($mod.ManifestInfo.Score)" }
+                $reasons += "ADVANCED ANALYSIS (Score: $advScore): $($advDetails -join ', ')"
             }
             $script:CheatMods += @{
                 FileName = $mod.FileName
@@ -2380,6 +2920,30 @@ function Analyze-ModsFolder {
                 Write-Host " (Clean)" -NoNewline -ForegroundColor $script:Colors.Success
                 Write-Host ""
             }
+            # Show advanced analysis results for unknown mods
+            $advScore = if ($mod.AdvancedScore) { $mod.AdvancedScore } else { 0 }
+            if ($advScore -gt 0) {
+                Write-Host "        Advanced Analysis (Score: $advScore):" -ForegroundColor $script:Colors.Secondary
+                if ($mod.BytecodeInfo -and $mod.BytecodeInfo.Score -gt 0) {
+                    $bcDetails = @()
+                    if ($mod.BytecodeInfo.Reflection.Count -gt 0) { $bcDetails += "Reflection:$($mod.BytecodeInfo.Reflection.Count)" }
+                    if ($mod.BytecodeInfo.DynamicLoading.Count -gt 0) { $bcDetails += "DynLoad:$($mod.BytecodeInfo.DynamicLoading.Count)" }
+                    if ($mod.BytecodeInfo.Networking.Count -gt 0) { $bcDetails += "Network:$($mod.BytecodeInfo.Networking.Count)" }
+                    if ($mod.BytecodeInfo.NativeAccess.Count -gt 0) { $bcDetails += "Native:$($mod.BytecodeInfo.NativeAccess.Count)" }
+                    Write-Host "          [BC] Bytecode: $($bcDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.EntropyInfo -and $mod.EntropyInfo.Score -gt 0) {
+                    Write-Host "          [EN] Entropy: $($mod.EntropyInfo.HighEntropyClasses.Count) high-entropy classes (Avg: $($mod.EntropyInfo.AverageEntropy), Max: $($mod.EntropyInfo.MaxEntropy))" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.MixinInfo -and $mod.MixinInfo.Score -gt 0) {
+                    Write-Host "          [MX] Mixins: $($mod.MixinInfo.SuspiciousTargets.Count) suspicious targets" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.ManifestInfo -and $mod.ManifestInfo.Score -gt 0) {
+                    foreach ($s in $mod.ManifestInfo.Suspicious) {
+                        Write-Host "          [MF] $s" -ForegroundColor $script:Colors.Warning
+                    }
+                }
+            }
             if ($mod.ZoneId) {
                 Write-Host "        Source: " -NoNewline -ForegroundColor $script:Colors.Dim
                 Write-Host $mod.ZoneId -ForegroundColor $script:Colors.Dim
@@ -2424,6 +2988,82 @@ function Analyze-ModsFolder {
                 Write-Host "        Obfuscation patterns:" -ForegroundColor $script:Colors.Warning
                 foreach ($indicator in $mod.ObfuscatorInfo.Indicators) {
                     Write-Host "          -> $indicator" -ForegroundColor $script:Colors.Dim
+                }
+            }
+        }
+    }
+    if ($script:ModURLFindings.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  [NET] " -NoNewline -ForegroundColor $script:Colors.Secondary
+        Write-Host "URL / DOMAIN / IP FINDINGS" -ForegroundColor $script:Colors.Secondary
+        Write-Host "  ====================================================" -ForegroundColor $script:Colors.Dim
+        foreach ($mod in $script:ModURLFindings) {
+            Write-Host ""
+            Write-Host "    [>] " -NoNewline -ForegroundColor $script:Colors.Secondary
+            Write-Host $mod.FileName -ForegroundColor $script:Colors.Info
+            if ($mod.URLs.Count -gt 0) {
+                Write-Host "        URLs found:" -ForegroundColor $script:Colors.Warning
+                foreach ($url in $mod.URLs) {
+                    # Highlight suspicious cheat-related URLs in red
+                    $isSuspicious = $false
+                    $suspiciousKeywords = @("vape", "intent", "novoline", "rise", "astolfo", "exhibition", "sigma", "nova", "doomsday", "prestige", "cheat", "hack", "inject", "exploit", "bypass", "hwid", "auth", "license", "loader", "panel", "webhook", "discord.com/api/webhooks", "pastebin", "hastebin", "paste.ee", "rentry", "anonfiles")
+                    foreach ($kw in $suspiciousKeywords) {
+                        if ($url -match [regex]::Escape($kw)) { $isSuspicious = $true; break }
+                    }
+                    if ($isSuspicious) {
+                        Write-Host "          [!] " -NoNewline -ForegroundColor $script:Colors.Error
+                        Write-Host $url -ForegroundColor $script:Colors.Error
+                    } else {
+                        Write-Host "          ->  " -NoNewline -ForegroundColor $script:Colors.Dim
+                        Write-Host $url -ForegroundColor $script:Colors.Accent
+                    }
+                }
+            }
+            if ($mod.IPs.Count -gt 0) {
+                Write-Host "        IP addresses found:" -ForegroundColor $script:Colors.Warning
+                foreach ($ip in $mod.IPs) {
+                    Write-Host "          [!] " -NoNewline -ForegroundColor $script:Colors.Warning
+                    Write-Host $ip -ForegroundColor $script:Colors.Warning
+                }
+            }
+        }
+    }
+    # Advanced Analysis Summary
+    if ($script:BytecodeFindings.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  [ADV] " -NoNewline -ForegroundColor $script:Colors.Primary
+        Write-Host "ADVANCED ANALYSIS FINDINGS" -ForegroundColor $script:Colors.Primary
+        Write-Host "  ====================================================" -ForegroundColor $script:Colors.Dim
+        foreach ($finding in $script:BytecodeFindings) {
+            Write-Host ""
+            Write-Host "    [>] " -NoNewline -ForegroundColor $script:Colors.Primary
+            Write-Host "$($finding.FileName)" -NoNewline -ForegroundColor $script:Colors.Info
+            Write-Host " (Advanced Score: $($finding.TotalAdvancedScore))" -ForegroundColor $(if ($finding.TotalAdvancedScore -ge 50) { $script:Colors.Error } elseif ($finding.TotalAdvancedScore -ge 25) { $script:Colors.Warning } else { $script:Colors.Dim })
+            if ($finding.BytecodeScore -gt 0) {
+                $bc = $finding.Bytecode
+                Write-Host "        [BC] Bytecode Analysis (Score: $($finding.BytecodeScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($bc.Reflection.Count -gt 0) { Write-Host "          Reflection calls: $($bc.Reflection.Count)" -ForegroundColor $script:Colors.Warning }
+                if ($bc.DynamicLoading.Count -gt 0) { Write-Host "          Dynamic classloading: $($bc.DynamicLoading.Count)" -ForegroundColor $script:Colors.Error }
+                if ($bc.Networking.Count -gt 0) { Write-Host "          Network operations: $($bc.Networking.Count)" -ForegroundColor $script:Colors.Warning }
+                if ($bc.NativeAccess.Count -gt 0) { Write-Host "          Native/Unsafe access: $($bc.NativeAccess.Count)" -ForegroundColor $script:Colors.Error }
+            }
+            if ($finding.EntropyScore -gt 0) {
+                $en = $finding.Entropy
+                Write-Host "        [EN] Entropy Analysis (Score: $($finding.EntropyScore)):" -ForegroundColor $script:Colors.Secondary
+                Write-Host "          High-entropy classes: $($en.HighEntropyClasses.Count) | Avg: $($en.AverageEntropy) | Max: $($en.MaxEntropy)" -ForegroundColor $script:Colors.Warning
+            }
+            if ($finding.MixinScore -gt 0) {
+                $mx = $finding.Mixin
+                Write-Host "        [MX] Mixin Config Analysis (Score: $($finding.MixinScore)):" -ForegroundColor $script:Colors.Secondary
+                Write-Host "          Suspicious targets: $($mx.SuspiciousTargets.Count)" -ForegroundColor $script:Colors.Warning
+                foreach ($target in ($mx.SuspiciousTargets | Select-Object -First 5)) {
+                    Write-Host "            -> $target" -ForegroundColor $script:Colors.Dim
+                }
+            }
+            if ($finding.ManifestScore -gt 0) {
+                Write-Host "        [MF] Manifest Analysis (Score: $($finding.ManifestScore)):" -ForegroundColor $script:Colors.Secondary
+                foreach ($s in $finding.Manifest.Suspicious) {
+                    Write-Host "            -> $s" -ForegroundColor $script:Colors.Error
                 }
             }
         }
