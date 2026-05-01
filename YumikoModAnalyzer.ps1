@@ -3429,10 +3429,41 @@ function Get-ModInfoFromJar {
     } catch {}
     return $modInfo
 }
-function Check-DisallowedMods {
+function Get-ModJarFiles {
     param([string]$ModsPath)
-    $jarFiles = Get-ChildItem -Path $ModsPath -Filter *.jar -ErrorAction SilentlyContinue
+    $jarFiles = @(Get-ChildItem -LiteralPath $ModsPath -Filter "*.jar" -Force -File -ErrorAction SilentlyContinue)
+    foreach ($jarFile in $jarFiles) {
+        $hasHiddenFlag = (([int]$jarFile.Attributes) -band [int][System.IO.FileAttributes]::Hidden) -ne 0
+        $hasSystemFlag = (([int]$jarFile.Attributes) -band [int][System.IO.FileAttributes]::System) -ne 0
+        $wasHidden = $hasHiddenFlag -or $hasSystemFlag
+        $visibilityRestored = $false
+        if ($wasHidden) {
+            try {
+                $visibilityMask = [int]([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)
+                $visibleAttributes = [System.IO.FileAttributes](([int]$jarFile.Attributes) -band (-bnot $visibilityMask))
+                [System.IO.File]::SetAttributes($jarFile.FullName, $visibleAttributes)
+                $jarFile = Get-Item -LiteralPath $jarFile.FullName -Force -ErrorAction SilentlyContinue
+                $visibilityRestored = $true
+            } catch {}
+        }
+        $displayName = if ($wasHidden) { "$($jarFile.Name) (hidden)" } else { $jarFile.Name }
+        $jarFile | Add-Member -NotePropertyName DisplayName -NotePropertyValue $displayName -Force
+        $jarFile | Add-Member -NotePropertyName WasHidden -NotePropertyValue $wasHidden -Force
+        $jarFile | Add-Member -NotePropertyName VisibilityRestored -NotePropertyValue $visibilityRestored -Force
+        $jarFile
+    }
+}
+function Get-ModDisplayName {
+    param([object]$ModFile)
+    if ($ModFile -and $ModFile.PSObject.Properties['DisplayName']) {
+        return $ModFile.DisplayName
+    }
+    return $ModFile.Name
+}
+function Check-DisallowedMods {
+    param([object[]]$JarFiles)
     foreach ($file in $jarFiles) {
+        $displayName = Get-ModDisplayName -ModFile $file
         $fileName = $file.Name.ToLower()
         $modInfo = Get-ModInfoFromJar -JarPath $file.FullName
         foreach ($modSlug in $script:DisallowedMods.Keys) {
@@ -3452,7 +3483,7 @@ function Check-DisallowedMods {
             }
             if ($isDisallowed) {
                 $script:DisallowedModsFound += @{
-                    FileName = $file.Name
+                    FileName = $displayName
                     ModName = $modData.Names[0]
                 }
                 break
@@ -3467,26 +3498,35 @@ function Analyze-ModsFolder {
         Write-Result "FAIL" "Mods folder not found" $ModsPath
         return
     }
-    $jarFiles = Get-ChildItem -Path $ModsPath -Filter "*.jar" -ErrorAction SilentlyContinue
+    $jarFiles = @(Get-ModJarFiles -ModsPath $ModsPath)
     if ($jarFiles.Count -eq 0) {
         Write-Result "INFO" "No JAR files found in mods folder"
         return
     }
+    $hiddenJarFiles = @($jarFiles | Where-Object { $_.WasHidden })
+    if ($hiddenJarFiles.Count -gt 0) {
+        Write-Result "WARN" "Hidden/system mods detected" "$($hiddenJarFiles.Count) file(s) made visible"
+        foreach ($hiddenFile in $hiddenJarFiles) {
+            $detail = if ($hiddenFile.VisibilityRestored) { "made visible" } else { "detected but could not clear attributes" }
+            Write-Result "INFO" "Hidden mod" "$($hiddenFile.DisplayName) - $detail"
+        }
+    }
     Write-Result "INFO" "Found $($jarFiles.Count) mod(s) to analyze"
     Write-Host ""
-    Check-DisallowedMods -ModsPath $ModsPath
+    Check-DisallowedMods -JarFiles $jarFiles
     $counter = 0
     $total = $jarFiles.Count
     foreach ($file in $jarFiles) {
+        $displayName = Get-ModDisplayName -ModFile $file
         $counter++
-        Write-ProgressBar -Current $counter -Total $total -Activity $file.Name
+        Write-ProgressBar -Current $counter -Total $total -Activity $displayName
         $hash = Get-SHA1Hash -FilePath $file.FullName
         $obfResult = Test-Obfuscator -FilePath $file.FullName
         $hasCriticalObfuscator = ($obfResult.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
         $isObfuscated = ($obfResult.Score -gt 60) -or $hasCriticalObfuscator
         if ($isObfuscated) {
             $script:ObfuscatedModsList += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 Score = $obfResult.Score
                 Detected = $obfResult.Detected
@@ -3496,7 +3536,7 @@ function Analyze-ModsFolder {
         $urlFindings = Test-JarURLsAndDomains -FilePath $file.FullName
         if ($urlFindings.URLs.Count -gt 0 -or $urlFindings.IPs.Count -gt 0 -or $urlFindings.SuspiciousTLDs.Count -gt 0) {
             $script:ModURLFindings += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 URLs = @($urlFindings.URLs)
                 Domains = @($urlFindings.Domains)
@@ -3507,16 +3547,16 @@ function Analyze-ModsFolder {
         $selfDestructResult = Test-SelfDestructPatterns -FilePath $file.FullName
         if ($selfDestructResult.Detected) {
             $script:SelfDestructFindings += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 Score = $selfDestructResult.Score
                 Indicators = $selfDestructResult.Indicators
                 Classes = $selfDestructResult.Classes
             }
             Write-Host "`r$(' ' * 80)`r" -NoNewline
-            Write-Result "FOUND" "Self Destruct Detected" $file.Name
+            Write-Result "FOUND" "Self Destruct Detected" $displayName
             $script:CheatMods += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 StringsFound = @("Self Destruct Detected")
                 InDependency = $false
@@ -3529,7 +3569,7 @@ function Analyze-ModsFolder {
         $modrinthResult = Test-ModrinthHash -Hash $hash
         if ($modrinthResult) {
             $script:VerifiedMods += @{
-                FileName = $file.Name
+                FileName = $displayName
                 ModName = $modrinthResult.Name
                 Source = $modrinthResult.Source
                 URL = $modrinthResult.URL
@@ -3541,7 +3581,7 @@ function Analyze-ModsFolder {
         $megabaseResult = Test-MegabaseHash -Hash $hash
         if ($megabaseResult) {
             $script:VerifiedMods += @{
-                FileName = $file.Name
+                FileName = $displayName
                 ModName = $megabaseResult.Name
                 Source = $megabaseResult.Source
                 IsObfuscated = $isObfuscated
@@ -3552,7 +3592,7 @@ function Analyze-ModsFolder {
         $cheatStringsFound = Test-CheatStrings -FilePath $file.FullName
         if ($cheatStringsFound.Count -gt 0) {
             $script:CheatMods += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 StringsFound = @($cheatStringsFound)
                 InDependency = $false
@@ -3574,7 +3614,7 @@ function Analyze-ModsFolder {
         # Track findings for reporting
         if ($advancedScore -gt 0) {
             $script:BytecodeFindings += @{
-                FileName = $file.Name
+                FileName = $displayName
                 BytecodeScore = $bytecodeResult.Score
                 EntropyScore = $entropyResult.Score
                 MixinScore = $mixinResult.Score
@@ -3640,7 +3680,7 @@ function Analyze-ModsFolder {
                 $advancedReasons += "ADV BYTECODE (Score: $($advBytecodeResult.Score)): $($abcDetails -join ', ')"
             }
             $script:CheatMods += @{
-                FileName = $file.Name
+                FileName = $displayName
                 FilePath = $file.FullName
                 StringsFound = $advancedReasons
                 InDependency = $false
@@ -3651,7 +3691,7 @@ function Analyze-ModsFolder {
         }
         $downloadSource = Get-ZoneIdentifier -FilePath $file.FullName
         $script:UnknownMods += @{
-            FileName = $file.Name
+            FileName = $displayName
             FilePath = $file.FullName
             ZoneId = $downloadSource
             Hash = $hash
