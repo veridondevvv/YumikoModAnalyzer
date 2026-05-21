@@ -16,7 +16,7 @@ $script:Config = @{
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns"
+    Features = "JVM Scan, Bypass Detectwiesoion, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -2698,6 +2698,8 @@ function Test-StringEncoding {
         Base64Strings = @()
         CharArrayPatterns = @()
         XorPatterns = 0
+        StringDecoderClasses = @()
+        StringDecoderCount = 0
         DecodedCheatHits = @()
         Score = 0
     }
@@ -2711,6 +2713,7 @@ function Test-StringEncoding {
         $scanned = 0
         $totalBase64Hits = 0
         $xorByteRepeatCount = 0
+        $stringDecoderCount = 0
         foreach ($entry in $classEntries) {
             if ($scanned -ge 150) { break }
             try {
@@ -2757,6 +2760,12 @@ function Test-StringEncoding {
                 if ($content -match $stringBuilderPattern) {
                     $findings.CharArrayPatterns += "$className -> StringBuilder chain (string construction)"
                 }
+                if ($content -match 'toCharArray' -and $content -match 'intern' -and $content -match 'java/lang/String' -and ($content -match 'substring' -or $content -match '\[C')) {
+                    $stringDecoderCount++
+                    if ($findings.StringDecoderClasses.Count -lt 25) {
+                        $findings.StringDecoderClasses += "$className -> char-array string decoder"
+                    }
+                }
                 # XOR pattern detection: look for repeating XOR byte sequences
                 # In .class constant pool, encrypted strings show repeating byte patterns
                 if ($bytes.Length -gt 200) {
@@ -2780,6 +2789,7 @@ function Test-StringEncoding {
         }
         $zip.Dispose()
         $findings.XorPatterns = $xorByteRepeatCount
+        $findings.StringDecoderCount = $stringDecoderCount
         # Scoring
         if ($findings.DecodedCheatHits.Count -gt 0) { $findings.Score += 30 + [Math]::Min(20, $findings.DecodedCheatHits.Count * 10) }
         if ($totalBase64Hits -gt 20) { $findings.Score += 15 }
@@ -2788,6 +2798,8 @@ function Test-StringEncoding {
         elseif ($findings.CharArrayPatterns.Count -gt 2) { $findings.Score += 8 }
         if ($xorByteRepeatCount -gt 10) { $findings.Score += 20 }
         elseif ($xorByteRepeatCount -gt 5) { $findings.Score += 10 }
+        if ($stringDecoderCount -gt 20) { $findings.Score += 20 }
+        elseif ($stringDecoderCount -gt 5) { $findings.Score += 10 }
         # Combo: Base64 decoded cheats + XOR = heavily encrypted cheat
         if ($findings.DecodedCheatHits.Count -gt 0 -and $xorByteRepeatCount -gt 3) {
             $findings.Score += 15
@@ -2966,6 +2978,185 @@ function Test-NativeLibraries {
         elseif ($highCount -gt 0) { $findings.Score += 10 }
         if ($findings.JniMethods.Count -gt 5) { $findings.Score += 15 }
         elseif ($findings.JniMethods.Count -gt 0) { $findings.Score += 8 }
+    } catch {}
+    return $findings
+}
+function Test-ArchiveStructureAnomalies {
+    param([string]$FilePath)
+    $findings = @{
+        Flags = @()
+        FabricMetadata = @()
+        Entrypoints = @()
+        MissingNestedJars = @()
+        EmbeddedPackageCounts = @{}
+        MixinConfigs = @()
+        TotalClasses = 0
+        Score = 0
+    }
+    function Add-ArchiveStructureFlag {
+        param([string]$Message, [int]$Points)
+        if ($Message -notin $findings.Flags) {
+            $findings.Flags += $Message
+            $findings.Score += $Points
+        }
+    }
+    function Read-YumikoZipEntryText {
+        param([System.IO.Compression.ZipArchiveEntry]$Entry)
+        try {
+            $reader = New-Object System.IO.StreamReader($Entry.Open(), [System.Text.Encoding]::UTF8)
+            $text = $reader.ReadToEnd()
+            $reader.Close()
+            return $text
+        } catch {}
+        return ""
+    }
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        $entryLookup = @{}
+        foreach ($zipEntry in $zip.Entries) {
+            $entryLookup[$zipEntry.FullName.ToLowerInvariant()] = $true
+        }
+        function Test-YumikoZipEntryExists {
+            param([string]$EntryPath)
+            if ([string]::IsNullOrWhiteSpace($EntryPath)) { return $false }
+            return $entryLookup.ContainsKey($EntryPath.ToLowerInvariant())
+        }
+        $classEntries = @($zip.Entries | Where-Object { $_.FullName -match '\.class$' })
+        $findings.TotalClasses = $classEntries.Count
+        $embeddedMinecraftClasses = @($classEntries | Where-Object { $_.FullName -match '^net/minecraft/' }).Count
+        $embeddedLoaderRuntimeClasses = @($classEntries | Where-Object { $_.FullName -match '^(net/fabricmc/loader|org/spongepowered/asm|net/fabricmc/tinyremapper)/' }).Count
+        $rootShortPackageClasses = @($classEntries | Where-Object { $_.FullName -match '^[A-Za-z]/' }).Count
+        $compatPackageClasses = @($classEntries | Where-Object { $_.FullName -match '/config/compat/[a-z](?:/|$)' }).Count
+        $findings.EmbeddedPackageCounts = @{
+            EmbeddedMinecraft = $embeddedMinecraftClasses
+            EmbeddedLoaderRuntime = $embeddedLoaderRuntimeClasses
+            RootShortPackage = $rootShortPackageClasses
+            CompatPackage = $compatPackageClasses
+        }
+        if ($embeddedMinecraftClasses -gt 100) {
+            Add-ArchiveStructureFlag "Embedded Minecraft classes in mod JAR: $embeddedMinecraftClasses" 25
+        } elseif ($embeddedMinecraftClasses -gt 20) {
+            Add-ArchiveStructureFlag "Embedded Minecraft classes in mod JAR: $embeddedMinecraftClasses" 15
+        }
+        if ($embeddedLoaderRuntimeClasses -gt 20) {
+            Add-ArchiveStructureFlag "Embedded Fabric/Mixin loader runtime classes: $embeddedLoaderRuntimeClasses" 20
+        } elseif ($embeddedLoaderRuntimeClasses -gt 0) {
+            Add-ArchiveStructureFlag "Embedded Fabric/Mixin loader runtime classes: $embeddedLoaderRuntimeClasses" 10
+        }
+        if ($rootShortPackageClasses -gt 100) {
+            Add-ArchiveStructureFlag "Mass root single-letter package classes: $rootShortPackageClasses" 15
+        }
+        if ($compatPackageClasses -gt 100) {
+            Add-ArchiveStructureFlag "Large obfuscated compat package payload: $compatPackageClasses classes" 15
+        }
+        if ($findings.TotalClasses -gt 1500 -and ($embeddedMinecraftClasses -gt 50 -or $rootShortPackageClasses -gt 100)) {
+            Add-ArchiveStructureFlag "Oversized mod archive with bundled runtime-like class tree: $($findings.TotalClasses) classes" 10
+        }
+        $fabricMetadataEntries = @($zip.Entries | Where-Object { $_.FullName -eq 'fabric.mod.json' -or $_.FullName -match '(^|/)fabric\.mod\.json$' })
+        $topFabricData = $null
+        foreach ($fabricEntry in $fabricMetadataEntries) {
+            $fabricText = Read-YumikoZipEntryText -Entry $fabricEntry
+            $fabricData = $fabricText | ConvertFrom-Json -ErrorAction SilentlyContinue
+            $metadataId = if ($fabricData -and $fabricData.id) { $fabricData.id } else { "<no id>" }
+            $findings.FabricMetadata += "$($fabricEntry.FullName): $metadataId"
+            if ($fabricEntry.FullName -eq 'fabric.mod.json') { $topFabricData = $fabricData }
+        }
+        if ($fabricMetadataEntries.Count -gt 1) {
+            Add-ArchiveStructureFlag "Multiple Fabric metadata files in one archive: $($fabricMetadataEntries.Count)" 12
+        }
+        $looseNestedMetadata = @($fabricMetadataEntries | Where-Object { $_.FullName -match '^META-INF/jars/' })
+        if ($looseNestedMetadata.Count -gt 0) {
+            $looseNames = ($looseNestedMetadata | Select-Object -ExpandProperty FullName -First 3) -join ', '
+            Add-ArchiveStructureFlag "Loose Fabric metadata under META-INF/jars without nested JAR: $looseNames" 18
+        }
+        $loaderEntry = $zip.Entries | Where-Object { $_.FullName -eq 'fabric_loader.json' } | Select-Object -First 1
+        if ($loaderEntry) {
+            $loaderText = Read-YumikoZipEntryText -Entry $loaderEntry
+            $loaderData = $loaderText | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($loaderData -and $loaderData.id) {
+                Add-ArchiveStructureFlag "Extra fabric_loader.json container metadata: $($loaderData.id)" 15
+            } else {
+                Add-ArchiveStructureFlag "Extra fabric_loader.json container metadata" 10
+            }
+            if ($loaderData -and $loaderData.PSObject.Properties['jars']) {
+                foreach ($jarReference in @($loaderData.jars)) {
+                    if ($jarReference -and $jarReference.file) {
+                        $nestedJarPath = $jarReference.file.ToString()
+                        if (-not (Test-YumikoZipEntryExists -EntryPath $nestedJarPath)) {
+                            $findings.MissingNestedJars += $nestedJarPath
+                            Add-ArchiveStructureFlag "Declared nested JAR is missing: $nestedJarPath" 20
+                        }
+                    }
+                }
+            }
+        }
+        if ($topFabricData -and $topFabricData.PSObject.Properties['entrypoints']) {
+            foreach ($entrypointProperty in $topFabricData.entrypoints.PSObject.Properties) {
+                foreach ($entrypointValue in @($entrypointProperty.Value)) {
+                    if ($null -eq $entrypointValue) { continue }
+                    $entrypointText = if ($entrypointValue -is [string]) { $entrypointValue } elseif ($entrypointValue.PSObject.Properties['value']) { $entrypointValue.value } else { $entrypointValue.ToString() }
+                    if ([string]::IsNullOrWhiteSpace($entrypointText)) { continue }
+                    $findings.Entrypoints += "$($entrypointProperty.Name): $entrypointText"
+                    if ($entrypointText -match '(?i)\.config\.compat\.[a-z](?:\.|$)') {
+                        Add-ArchiveStructureFlag "Entrypoint delegates into obfuscated compat namespace: $entrypointText" 15
+                    }
+                }
+            }
+        }
+        $mixinEntryMap = @{}
+        if ($topFabricData -and $topFabricData.PSObject.Properties['mixins']) {
+            foreach ($mixinReference in @($topFabricData.mixins)) {
+                if ($null -eq $mixinReference) { continue }
+                $mixinPath = if ($mixinReference -is [string]) { $mixinReference } elseif ($mixinReference.PSObject.Properties['config']) { $mixinReference.config } else { $mixinReference.ToString() }
+                if ([string]::IsNullOrWhiteSpace($mixinPath)) { continue }
+                $mixinEntry = $zip.Entries | Where-Object { $_.FullName -eq $mixinPath } | Select-Object -First 1
+                if ($mixinEntry) { $mixinEntryMap[$mixinEntry.FullName] = $mixinEntry }
+            }
+        }
+        foreach ($jsonEntry in @($zip.Entries | Where-Object { $_.Name -match '(?i)(mixin|mixins|compat).*\.json$' })) {
+            $mixinEntryMap[$jsonEntry.FullName] = $jsonEntry
+        }
+        foreach ($mixinEntry in $mixinEntryMap.Values) {
+            $mixinText = Read-YumikoZipEntryText -Entry $mixinEntry
+            $mixinData = $mixinText | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if (-not $mixinData) { continue }
+            $mixinClassNames = @()
+            foreach ($mixinPropertyName in 'client','server','mixins') {
+                $mixinProperty = $mixinData.PSObject.Properties[$mixinPropertyName]
+                if ($mixinProperty) {
+                    foreach ($mixinClassName in @($mixinProperty.Value)) {
+                        if ($null -ne $mixinClassName) { $mixinClassNames += $mixinClassName.ToString() }
+                    }
+                }
+            }
+            if ($mixinClassNames.Count -eq 0) { continue }
+            $packageName = if ($mixinData.PSObject.Properties['package']) { $mixinData.package.ToString() } else { "" }
+            $refmapName = if ($mixinData.PSObject.Properties['refmap']) { $mixinData.refmap.ToString() } else { "" }
+            $requiredMixinConfig = $false
+            if ($mixinData.PSObject.Properties['required']) { $requiredMixinConfig = [bool]$mixinData.required }
+            $shortMixinNames = @($mixinClassNames | Where-Object { $_ -match '^(?:[a-z]\.)?[A-Za-z]{1,16}[A-Z]$' -or $_ -match '^[a-z](?:\.[a-z])+\.[A-Za-z]{1,16}[A-Z]$' })
+            $shortNameRatio = if ($mixinClassNames.Count -gt 0) { $shortMixinNames.Count / $mixinClassNames.Count } else { 0 }
+            $findings.MixinConfigs += @{
+                File = $mixinEntry.FullName
+                Package = $packageName
+                Count = $mixinClassNames.Count
+                ShortNameCount = $shortMixinNames.Count
+                Required = $requiredMixinConfig
+                Refmap = $refmapName
+            }
+            if ($mixinClassNames.Count -ge 30 -and $shortNameRatio -ge 0.7) {
+                Add-ArchiveStructureFlag "Large obfuscated mixin config: $($mixinEntry.FullName) ($($mixinClassNames.Count) classes)" 18
+            }
+            if ($requiredMixinConfig -and $mixinClassNames.Count -ge 20 -and $packageName -match '(?i)\.config\.compat\.[a-z](?:\.|$)') {
+                Add-ArchiveStructureFlag "Required compat mixin payload under obfuscated namespace: $packageName" 12
+            }
+            if (-not [string]::IsNullOrWhiteSpace($refmapName) -and -not (Test-YumikoZipEntryExists -EntryPath $refmapName)) {
+                Add-ArchiveStructureFlag "Mixin refmap declared but missing: $refmapName" 8
+            }
+        }
+        $findings.Score = [Math]::Min(90, [int]$findings.Score)
+        $zip.Dispose()
     } catch {}
     return $findings
 }
@@ -3609,8 +3800,9 @@ function Analyze-ModsFolder {
         $stringEncResult = Test-StringEncoding -FilePath $file.FullName
         $refmapResult = Test-RefmapAnalysis -FilePath $file.FullName
         $nativeResult = Test-NativeLibraries -FilePath $file.FullName
+        $archiveStructureResult = Test-ArchiveStructureAnomalies -FilePath $file.FullName
         $advBytecodeResult = Test-AdvancedBytecodePatterns -FilePath $file.FullName
-        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $advBytecodeResult.Score
+        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score
         # Track findings for reporting
         if ($advancedScore -gt 0) {
             $script:BytecodeFindings += @{
@@ -3622,6 +3814,7 @@ function Analyze-ModsFolder {
                 StringEncScore = $stringEncResult.Score
                 RefmapScore = $refmapResult.Score
                 NativeScore = $nativeResult.Score
+                ArchiveStructureScore = $archiveStructureResult.Score
                 AdvBytecodeScore = $advBytecodeResult.Score
                 TotalAdvancedScore = $advancedScore
                 Bytecode = $bytecodeResult
@@ -3631,6 +3824,7 @@ function Analyze-ModsFolder {
                 StringEnc = $stringEncResult
                 Refmap = $refmapResult
                 Native = $nativeResult
+                ArchiveStructure = $archiveStructureResult
                 AdvBytecode = $advBytecodeResult
             }
         }
@@ -3661,6 +3855,7 @@ function Analyze-ModsFolder {
                 if ($stringEncResult.Base64Strings.Count -gt 0) { $encDetails += "Base64:$($stringEncResult.Base64Strings.Count)" }
                 if ($stringEncResult.CharArrayPatterns.Count -gt 0) { $encDetails += "CharArray:$($stringEncResult.CharArrayPatterns.Count)" }
                 if ($stringEncResult.XorPatterns -gt 0) { $encDetails += "XOR:$($stringEncResult.XorPatterns)" }
+                if ($stringEncResult.StringDecoderCount -gt 0) { $encDetails += "StringDecoder:$($stringEncResult.StringDecoderCount)" }
                 $advancedReasons += "STRING ENCODING (Score: $($stringEncResult.Score)): $($encDetails -join ', ')"
             }
             if ($refmapResult.Score -gt 0) {
@@ -3670,6 +3865,10 @@ function Analyze-ModsFolder {
                 $nativeDetails = @()
                 foreach ($nf in $nativeResult.NativeFiles) { $nativeDetails += $nf.Path }
                 $advancedReasons += "NATIVE LIBRARIES (Score: $($nativeResult.Score)): $($nativeDetails -join ', ')"
+            }
+            if ($archiveStructureResult.Score -gt 0) {
+                $archiveDetails = @($archiveStructureResult.Flags | Select-Object -First 5)
+                $advancedReasons += "ARCHIVE STRUCTURE (Score: $($archiveStructureResult.Score)): $($archiveDetails -join '; ')"
             }
             if ($advBytecodeResult.Score -gt 0) {
                 $abcDetails = @()
@@ -3705,6 +3904,7 @@ function Analyze-ModsFolder {
             StringEncInfo = $stringEncResult
             RefmapInfo = $refmapResult
             NativeInfo = $nativeResult
+            ArchiveStructureInfo = $archiveStructureResult
             AdvBytecodeInfo = $advBytecodeResult
         }
     }
@@ -3731,6 +3931,7 @@ function Analyze-ModsFolder {
                 if ($mod.StringEncInfo -and $mod.StringEncInfo.Score -gt 0) { $advDetails += "StringEnc:$($mod.StringEncInfo.Score)" }
                 if ($mod.RefmapInfo -and $mod.RefmapInfo.Score -gt 0) { $advDetails += "Refmap:$($mod.RefmapInfo.Score)" }
                 if ($mod.NativeInfo -and $mod.NativeInfo.Score -gt 0) { $advDetails += "Native:$($mod.NativeInfo.Score)" }
+                if ($mod.ArchiveStructureInfo -and $mod.ArchiveStructureInfo.Score -gt 0) { $advDetails += "ArchiveStruct:$($mod.ArchiveStructureInfo.Score)" }
                 if ($mod.AdvBytecodeInfo -and $mod.AdvBytecodeInfo.Score -gt 0) { $advDetails += "AdvBC:$($mod.AdvBytecodeInfo.Score)" }
                 $reasons += "ADVANCED ANALYSIS (Score: $advScore): $($advDetails -join ', ')"
             }
@@ -3814,6 +4015,7 @@ function Analyze-ModsFolder {
                     if ($mod.StringEncInfo.Base64Strings.Count -gt 0) { $seDetails += "Base64:$($mod.StringEncInfo.Base64Strings.Count)" }
                     if ($mod.StringEncInfo.CharArrayPatterns.Count -gt 0) { $seDetails += "CharArrays:$($mod.StringEncInfo.CharArrayPatterns.Count)" }
                     if ($mod.StringEncInfo.XorPatterns -gt 0) { $seDetails += "XOR:$($mod.StringEncInfo.XorPatterns)" }
+                    if ($mod.StringEncInfo.StringDecoderCount -gt 0) { $seDetails += "StringDecoder:$($mod.StringEncInfo.StringDecoderCount)" }
                     Write-Host "          [SE] String Encoding: $($seDetails -join ', ')" -ForegroundColor $script:Colors.Warning
                 }
                 if ($mod.RefmapInfo -and $mod.RefmapInfo.Score -gt 0) {
@@ -3823,6 +4025,12 @@ function Analyze-ModsFolder {
                     $nfList = @()
                     foreach ($nf in $mod.NativeInfo.NativeFiles) { $nfList += $nf.Path }
                     Write-Host "          [NL] Native Libs: $($nfList -join ', ')" -ForegroundColor $script:Colors.Error
+                }
+                if ($mod.ArchiveStructureInfo -and $mod.ArchiveStructureInfo.Score -gt 0) {
+                    Write-Host "          [AS] Archive Structure: $($mod.ArchiveStructureInfo.Score) score" -ForegroundColor $script:Colors.Error
+                    foreach ($flag in ($mod.ArchiveStructureInfo.Flags | Select-Object -First 4)) {
+                        Write-Host "               -> $flag" -ForegroundColor $script:Colors.Dim
+                    }
                 }
                 if ($mod.AdvBytecodeInfo -and $mod.AdvBytecodeInfo.Score -gt 0) {
                     $abDetails = @()
@@ -3970,6 +4178,7 @@ function Analyze-ModsFolder {
                 if ($se.Base64Strings.Count -gt 0) { Write-Host "          Suspicious Base64 strings: $($se.Base64Strings.Count)" -ForegroundColor $script:Colors.Warning }
                 if ($se.CharArrayPatterns.Count -gt 0) { Write-Host "          Char array constructions: $($se.CharArrayPatterns.Count)" -ForegroundColor $script:Colors.Warning }
                 if ($se.XorPatterns -gt 0) { Write-Host "          XOR byte patterns: $($se.XorPatterns)" -ForegroundColor $script:Colors.Error }
+                if ($se.StringDecoderCount -gt 0) { Write-Host "          Char-array string decoders: $($se.StringDecoderCount)" -ForegroundColor $script:Colors.Error }
             }
             if ($finding.RefmapScore -gt 0) {
                 $rm = $finding.Refmap
@@ -3985,6 +4194,13 @@ function Analyze-ModsFolder {
                 foreach ($nf in $nl.NativeFiles) {
                     $jniLabel = if ($nf.HasJNI) { " [JNI]" } else { "" }
                     Write-Host "          $($nf.Path)$jniLabel" -ForegroundColor $script:Colors.Error
+                }
+            }
+            if ($finding.ArchiveStructureScore -gt 0) {
+                $archiveStructure = $finding.ArchiveStructure
+                Write-Host "        [AS] Archive Structure (Score: $($finding.ArchiveStructureScore)):" -ForegroundColor $script:Colors.Secondary
+                foreach ($flag in ($archiveStructure.Flags | Select-Object -First 6)) {
+                    Write-Host "            -> $flag" -ForegroundColor $script:Colors.Error
                 }
             }
             if ($finding.AdvBytecodeScore -gt 0) {
