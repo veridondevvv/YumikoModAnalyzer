@@ -6,17 +6,17 @@
     [switch]$Silent
 )
 $script:Config = @{
-    Version = "5.0.0"
+    Version = "5.1.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
     ModrinthAPI = "https://api.modrinth.com/v2"
     MegabaseAPI = "https://megabase.vercel.app/api/query"
-    CheatSignatures = "600+"
+    CheatSignatures = "650+"
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export"
+    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export, Class-File Heuristics, Mixin Combo Profiles, String Decryptor Bytecode Detection, Bytecode Sequence Patterns, Extended Memory Signatures"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -999,6 +999,18 @@ function Check-JavaProcessMemory {
         "5ZwdcRci",
         "cdn.modrinth.com/data/5ZwdcRci"
     )
+    $genericMemorySignatures = @(
+        "clickgui", "ClickGUI", "click_gui", "HudEditor", "HUDEditor",
+        "ArrayList", "arraylist", "ModuleList", "modulelist",
+        "Watermark", "watermark", "TargetHUD", "targethud",
+        "Category.COMBAT", "Category.MOVEMENT", "Category.RENDER",
+        "MixinConfig", "refmap.json", "mixin.refmap",
+        "JVM_OnLoad", "Agent_OnLoad", "javaagent", "premain",
+        "instrument", "retransform", "redefineClasses",
+        "discord.com/api/webhooks", "api/webhooks/",
+        "hwid", "license", "auth", "panel", "checkAuth",
+        "SetWindowsHookEx", "GetAsyncKeyState", "RegisterHotKey"
+    )
     $allSignatures = $doomsdaySignatures + $cheatSignatures
     try {
         $javaProcesses = @()
@@ -1095,6 +1107,23 @@ function Check-JavaProcessMemory {
                                                         $found = $true
                                                         break
                                                     }
+                                                }
+                                            }
+                                            # Generic cheat signatures (GUI, injection, webhook, etc.)
+                                            $genericHits = 0
+                                            foreach ($sig in $genericMemorySignatures) {
+                                                if ($memString.IndexOf($sig, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                                                    Write-Result "FOUND" "GENERIC CHEAT SIGNATURE in MEMORY" "$sig (PID: $($proc.Id))"
+                                                    $script:SystemFindings += @{
+                                                        Type = "GenericMemoryCheat"
+                                                        Description = "Generic cheat signature in RAM: $sig"
+                                                        PID = $proc.Id
+                                                        Address = $memInfo.BaseAddress.ToString("X")
+                                                        Severity = "CRITICAL"
+                                                    }
+                                                    $found = $true
+                                                    $genericHits++
+                                                    if ($genericHits -ge 5) { break }
                                                 }
                                             }
                                         }
@@ -3226,6 +3255,236 @@ function Test-AdvancedBytecodePatterns {
     } catch {}
     return $findings
 }
+function Test-ClassFileHeuristics {
+    param([object[]]$Entries)
+    $findings = @{
+        InvokeDynamicCount = 0
+        MethodHandleCount = 0
+        ReflectionRefs = 0
+        InvokeRefs = 0
+        UnsafeRefs = 0
+        InstrumentRefs = 0
+        NativeMethods = 0
+        Score = 0
+        Details = @()
+    }
+    try {
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 50 -MaxLength 500000
+        foreach ($entry in $classEntries) {
+            try {
+                $bytes = $entry.Bytes
+                if ($bytes.Length -lt 10) { continue }
+                if ($bytes[0] -ne 0xCA -or $bytes[1] -ne 0xFE -or $bytes[2] -ne 0xBA -or $bytes[3] -ne 0xBE) { continue }
+                $cpCount = ([int]$bytes[8] -shl 8) + $bytes[9]
+                if ($cpCount -le 1) { continue }
+                $cpCount--
+                $idx = 10
+                $utf8Strings = @{}
+                $tagCounts = @{}
+                for ($i = 1; $i -le $cpCount -and $idx -lt $bytes.Length; $i++) {
+                    $tag = $bytes[$idx]
+                    if ($tagCounts.ContainsKey($tag)) { $tagCounts[$tag]++ } else { $tagCounts[$tag] = 1 }
+                    $idx++
+                    switch ($tag) {
+                        1 {
+                            $len = ([int]$bytes[$idx] -shl 8) + $bytes[$idx+1]
+                            $idx += 2
+                            if ($idx + $len -le $bytes.Length) {
+                                $str = [System.Text.Encoding]::UTF8.GetString($bytes, $idx, $len)
+                                $utf8Strings[$i] = $str
+                            }
+                            $idx += $len
+                        }
+                        7 { $idx += 2 }
+                        8 { $idx += 2 }
+                        9 { $idx += 4 }
+                        10 { $idx += 4 }
+                        11 { $idx += 4 }
+                        12 { $idx += 4 }
+                        15 { $idx += 3 }
+                        16 { $idx += 2 }
+                        17 { $idx += 3 }
+                        18 { $idx += 4 }
+                        3 { $idx += 4 }
+                        4 { $idx += 4 }
+                        5 { $idx += 8; $i++ }
+                        6 { $idx += 8; $i++ }
+                        default { $idx = $bytes.Length; break }
+                    }
+                }
+                if ($tagCounts.ContainsKey(18)) { $findings.InvokeDynamicCount += $tagCounts[18] }
+                if ($tagCounts.ContainsKey(15)) { $findings.MethodHandleCount += $tagCounts[15] }
+                foreach ($str in $utf8Strings.Values) {
+                    if ($str -match "java/lang/reflect") { $findings.ReflectionRefs++ }
+                    if ($str -match "java/lang/invoke") { $findings.InvokeRefs++ }
+                    if ($str -match "sun/misc/Unsafe") { $findings.UnsafeRefs++ }
+                    if ($str -match "java/lang/instrument") { $findings.InstrumentRefs++ }
+                }
+                $contentStr = [System.Text.Encoding]::ASCII.GetString($bytes)
+                if ($contentStr -match "JNI_OnLoad|registerNatives") { $findings.NativeMethods++ }
+            } catch {}
+        }
+        if ($findings.InvokeDynamicCount -gt 30) { $findings.Score += 25; $findings.Details += "InvokeDynamic: $($findings.InvokeDynamicCount) (heavy string encryption)" }
+        elseif ($findings.InvokeDynamicCount -gt 10) { $findings.Score += 15; $findings.Details += "InvokeDynamic: $($findings.InvokeDynamicCount)" }
+        elseif ($findings.InvokeDynamicCount -gt 5) { $findings.Score += 8 }
+        if ($findings.MethodHandleCount -gt 10) { $findings.Score += 20; $findings.Details += "MethodHandle: $($findings.MethodHandleCount) (reflection obfuscation)" }
+        elseif ($findings.MethodHandleCount -gt 5) { $findings.Score += 12 }
+        elseif ($findings.MethodHandleCount -gt 0) { $findings.Score += 5 }
+        if ($findings.ReflectionRefs -gt 10) { $findings.Score += 15; $findings.Details += "Reflection refs: $($findings.ReflectionRefs)" }
+        elseif ($findings.ReflectionRefs -gt 5) { $findings.Score += 8 }
+        if ($findings.InvokeRefs -gt 20) { $findings.Score += 15; $findings.Details += "Invoke API refs: $($findings.InvokeRefs)" }
+        elseif ($findings.InvokeRefs -gt 10) { $findings.Score += 8 }
+        if ($findings.UnsafeRefs -gt 0) { $findings.Score += 15; $findings.Details += "Unsafe refs: $($findings.UnsafeRefs)" }
+        if ($findings.InstrumentRefs -gt 0) { $findings.Score += 20; $findings.Details += "Instrumentation refs: $($findings.InstrumentRefs) (runtime redefinition)" }
+        if ($findings.NativeMethods -gt 0) { $findings.Score += 15; $findings.Details += "Native methods: $($findings.NativeMethods)" }
+        if ($findings.InvokeDynamicCount -gt 10 -and $findings.MethodHandleCount -gt 5 -and $findings.ReflectionRefs -gt 5) {
+            $findings.Score += 25
+            $findings.Details += "CRITICAL: Heavy obfuscation combo (InvokeDynamic + MethodHandle + Reflection)"
+        }
+        if ($findings.Score -gt 100) { $findings.Score = 100 }
+    } catch {}
+    return $findings
+}
+function Test-MixinComboProfiles {
+    param([object[]]$Entries)
+    $findings = @{
+        Score = 0
+        ProfileMatches = @()
+        Categories = @{}
+    }
+    try {
+        $refmapEntries = @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.Name -match '-refmap\.json$|refmap.*\.json$' })
+        if ($refmapEntries.Count -eq 0) { return $findings }
+        $categories = @{ Combat = 0; Movement = 0; Render = 0; Packet = 0; Inventory = 0; World = 0; Input = 0 }
+        $categoryPatterns = @{
+            Combat   = "(?i)(PlayerEntity;attack|swingHand|ItemCooldownManager|CombatTracker|getAttackCooldownProgress|ArmorItem|PlayerInteractManager|clickBlock|ItemStack;use)"
+            Movement = "(?i)(Entity;move|travel|jump|sendMovementPackets|setPos|pushOutOfBlocks|isOnGround|noClip|stepHeight|fallDistance|updateVelocity)"
+            Render   = "(?i)(WorldRenderer|GameRenderer|EntityRenderDispatcher|LivingEntityRenderer|ItemRenderer|BufferBuilder|Lightmap|RenderLayer|InGameHud)"
+            Packet   = "(?i)(ClientConnection|NetworkHandler|PacketByteBuf|PlayerMoveC2SPacket|PlayerInteractEntityC2SPacket|EntityVelocityUpdateS2CPacket|CustomPayload|KeepAlive|ClickSlot)"
+            Inventory= "(?i)(HandledScreen|PlayerInventory|ScreenHandler|SlotActionType|CursorStackReference|CreativeInventoryScreen|transferSlot)"
+            World    = "(?i)(ClientWorld|ChunkBuilder|BlockBreakingInfo|NbtCompound)"
+            Input    = "(?i)(KeyboardInput|Mouse|MinecraftClient)"
+        }
+        foreach ($entry in $refmapEntries) {
+            try {
+                $content = [System.Text.Encoding]::UTF8.GetString($entry.Bytes)
+                foreach ($cat in $categoryPatterns.Keys) {
+                    $matches = [regex]::Matches($content, $categoryPatterns[$cat])
+                    if ($matches.Count -gt 0) { $categories[$cat] += $matches.Count }
+                }
+            } catch {}
+        }
+        $activeCats = ($categories.GetEnumerator() | Where-Object { $_.Value -gt 0 }).Count
+        $profiles = @{
+            "FullCombatClient"    = @{ Required = @("Combat","Packet");       Bonus = @("Movement","Render"); Weight = 35 }
+            "MovementCheat"       = @{ Required = @("Movement","Packet");       Bonus = @("Render");           Weight = 30 }
+            "RenderCheat"         = @{ Required = @("Render","Packet");        Bonus = @("Combat");           Weight = 25 }
+            "InventoryManipulator"= @{ Required = @("Inventory","Packet");     Bonus = @("Combat");           Weight = 30 }
+            "WorldExploit"        = @{ Required = @("World","Packet");          Bonus = @("Combat");           Weight = 20 }
+            "UniversalCheat"      = @{ Required = @("Combat","Movement","Render","Packet"); Bonus = @("Inventory"); Weight = 50 }
+        }
+        foreach ($profName in $profiles.Keys) {
+            $prof = $profiles[$profName]
+            $reqMet = 0
+            foreach ($r in $prof.Required) { if ($categories[$r] -gt 0) { $reqMet++ } }
+            if ($reqMet -eq $prof.Required.Count) {
+                $findings.ProfileMatches += $profName
+                $findings.Score += $prof.Weight
+            }
+        }
+        if ($activeCats -ge 4) {
+            $findings.Score += 20
+            $findings.ProfileMatches += "MultiCategory($activeCats)"
+        }
+        $findings.Categories = $categories
+        if ($findings.Score -gt 100) { $findings.Score = 100 }
+    } catch {}
+    return $findings
+}
+function Test-StringDecryptorBytecode {
+    param([object[]]$Entries)
+    $findings = @{
+        DecryptorClasses = 0
+        ClinitStringArrays = 0
+        Score = 0
+        Details = @()
+    }
+    try {
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 200 -MaxLength 500000
+        foreach ($entry in $classEntries) {
+            try {
+                $bytes = $entry.Bytes
+                if ($bytes.Length -lt 20) { continue }
+                $content = [System.Text.Encoding]::ASCII.GetString($bytes)
+                $hasDecrypt = $content -match "(?i)(decrypt|decode|getString|[ab]\\d)\\([\\[BLI]*\\)[\\[BLI]*Ljava/lang/String;"
+                $hasClinit = $content -match "(?i)<clinit>"
+                $aastoreCount = 0
+                $checkLen = [Math]::Min($bytes.Length, 3000)
+                for ($i = 0; $i -lt $checkLen; $i++) {
+                    if ($bytes[$i] -eq 0x53) { $aastoreCount++ }
+                }
+                $isStringArrayHeavy = $aastoreCount -gt 15
+                $hasByteArrayInit = $false
+                for ($i = 0; $i -lt $bytes.Length - 1; $i++) {
+                    if ($bytes[$i] -eq 0xBC -and $bytes[$i+1] -eq 0x04) { $hasByteArrayInit = $true; break }
+                }
+                if ($hasDecrypt -and $hasClinit) {
+                    $findings.DecryptorClasses++
+                    $findings.Score += 15
+                }
+                if ($isStringArrayHeavy -and $hasClinit) {
+                    $findings.ClinitStringArrays++
+                    $findings.Score += 10
+                }
+                if ($hasByteArrayInit -and $isStringArrayHeavy) {
+                    $findings.Score += 5
+                }
+            } catch {}
+        }
+        if ($findings.DecryptorClasses -gt 0) { $findings.Details += "String decryptor classes: $($findings.DecryptorClasses)" }
+        if ($findings.ClinitStringArrays -gt 0) { $findings.Details += "Heavy <clinit> string arrays: $($findings.ClinitStringArrays)" }
+        if ($findings.Score -gt 100) { $findings.Score = 100 }
+    } catch {}
+    return $findings
+}
+function Test-BytecodeSequencePatterns {
+    param([object[]]$Entries)
+    $findings = @{
+        ReflectionSequences = 0
+        UnsafeSequences = 0
+        InstrumentSequences = 0
+        JniSequences = 0
+        Score = 0
+        Details = @()
+    }
+    try {
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 100 -MaxLength 500000
+        foreach ($entry in $classEntries) {
+            try {
+                $bytes = $entry.Bytes
+                if ($bytes.Length -lt 20) { continue }
+                $content = [System.Text.Encoding]::ASCII.GetString($bytes)
+                $hasForName = $content -match "java/lang/Class.*forName"
+                $hasMethodInvoke = $content -match "java/lang/reflect/Method.*invoke"
+                if ($hasForName -and $hasMethodInvoke) { $findings.ReflectionSequences++ }
+                $hasUnsafe = $content -match "sun/misc/Unsafe"
+                $hasUnsafeOp = $content -match "(getUnsafe|putInt|putLong|copyMemory|allocateMemory)"
+                if ($hasUnsafe -and $hasUnsafeOp) { $findings.UnsafeSequences++ }
+                $hasInstr = $content -match "java/lang/instrument/Instrumentation"
+                $hasRedefine = $content -match "(redefineClasses|retransformClasses)"
+                if ($hasInstr -or $hasRedefine) { $findings.InstrumentSequences++ }
+                if ($content -match "System\.loadLibrary|System\.load|JNI_OnLoad") { $findings.JniSequences++ }
+            } catch {}
+        }
+        if ($findings.ReflectionSequences -gt 5) { $findings.Score += 15; $findings.Details += "Reflection chains: $($findings.ReflectionSequences)" }
+        elseif ($findings.ReflectionSequences -gt 0) { $findings.Score += 8 }
+        if ($findings.UnsafeSequences -gt 0) { $findings.Score += 20; $findings.Details += "Unsafe usage: $($findings.UnsafeSequences)" }
+        if ($findings.InstrumentSequences -gt 0) { $findings.Score += 25; $findings.Details += "Instrumentation hooks: $($findings.InstrumentSequences)" }
+        if ($findings.JniSequences -gt 0) { $findings.Score += 15; $findings.Details += "JNI loading: $($findings.JniSequences)" }
+        if ($findings.Score -gt 100) { $findings.Score = 100 }
+    } catch {}
+    return $findings
+}
 function Test-ManifestSuspicious {
     param([object[]]$Entries)
     $findings = @{
@@ -3757,7 +4016,11 @@ function Analyze-ModsFolder {
         $nativeResult = Test-NativeLibraries -Entries $entries
         $archiveStructureResult = Test-ArchiveStructureAnomalies -Entries $entries
         $advBytecodeResult = Test-AdvancedBytecodePatterns -Entries $entries
-        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score
+        $classFileResult = Test-ClassFileHeuristics -Entries $entries
+        $mixinComboResult = Test-MixinComboProfiles -Entries $entries
+        $stringDecryptorResult = Test-StringDecryptorBytecode -Entries $entries
+        $bytecodeSeqResult = Test-BytecodeSequencePatterns -Entries $entries
+        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score + $classFileResult.Score + $mixinComboResult.Score + $stringDecryptorResult.Score + $bytecodeSeqResult.Score
         # Track findings for reporting
         if ($advancedScore -gt 0) {
             $script:BytecodeFindings += @{
@@ -3771,6 +4034,10 @@ function Analyze-ModsFolder {
                 NativeScore = $nativeResult.Score
                 ArchiveStructureScore = $archiveStructureResult.Score
                 AdvBytecodeScore = $advBytecodeResult.Score
+                ClassFileScore = $classFileResult.Score
+                MixinComboScore = $mixinComboResult.Score
+                StringDecryptorScore = $stringDecryptorResult.Score
+                BytecodeSeqScore = $bytecodeSeqResult.Score
                 TotalAdvancedScore = $advancedScore
                 Bytecode = $bytecodeResult
                 Entropy = $entropyResult
@@ -3781,6 +4048,10 @@ function Analyze-ModsFolder {
                 Native = $nativeResult
                 ArchiveStructure = $archiveStructureResult
                 AdvBytecode = $advBytecodeResult
+                ClassFile = $classFileResult
+                MixinCombo = $mixinComboResult
+                StringDecryptor = $stringDecryptorResult
+                BytecodeSeq = $bytecodeSeqResult
             }
         }
         # If advanced analysis flags this mod as highly suspicious, mark as cheat
@@ -3833,6 +4104,34 @@ function Analyze-ModsFolder {
                 if ($advBytecodeResult.DeadCodeClasses -gt 0) { $abcDetails += "DeadCode:$($advBytecodeResult.DeadCodeClasses)" }
                 $advancedReasons += "ADV BYTECODE (Score: $($advBytecodeResult.Score)): $($abcDetails -join ', ')"
             }
+            if ($classFileResult.Score -gt 0) {
+                $cfDetails = @()
+                if ($classFileResult.InvokeDynamicCount -gt 0) { $cfDetails += "InvokeDyn:$($classFileResult.InvokeDynamicCount)" }
+                if ($classFileResult.MethodHandleCount -gt 0) { $cfDetails += "MethodHandle:$($classFileResult.MethodHandleCount)" }
+                if ($classFileResult.ReflectionRefs -gt 0) { $cfDetails += "ReflectRefs:$($classFileResult.ReflectionRefs)" }
+                if ($classFileResult.UnsafeRefs -gt 0) { $cfDetails += "Unsafe:$($classFileResult.UnsafeRefs)" }
+                if ($classFileResult.InstrumentRefs -gt 0) { $cfDetails += "Instr:$($classFileResult.InstrumentRefs)" }
+                $advancedReasons += "CLASS FILE HEURISTICS (Score: $($classFileResult.Score)): $($cfDetails -join ', ')"
+            }
+            if ($mixinComboResult.Score -gt 0) {
+                $mcDetails = @()
+                if ($mixinComboResult.ProfileMatches.Count -gt 0) { $mcDetails += "Profiles:$($mixinComboResult.ProfileMatches -join ',')" }
+                $advancedReasons += "MIXIN COMBO PROFILES (Score: $($mixinComboResult.Score)): $($mcDetails -join ', ')"
+            }
+            if ($stringDecryptorResult.Score -gt 0) {
+                $sdDetails = @()
+                if ($stringDecryptorResult.DecryptorClasses -gt 0) { $sdDetails += "Decryptors:$($stringDecryptorResult.DecryptorClasses)" }
+                if ($stringDecryptorResult.ClinitStringArrays -gt 0) { $sdDetails += "ClinitArrays:$($stringDecryptorResult.ClinitStringArrays)" }
+                $advancedReasons += "STRING DECRYPTOR BYTECODE (Score: $($stringDecryptorResult.Score)): $($sdDetails -join ', ')"
+            }
+            if ($bytecodeSeqResult.Score -gt 0) {
+                $bsDetails = @()
+                if ($bytecodeSeqResult.ReflectionSequences -gt 0) { $bsDetails += "ReflectSeq:$($bytecodeSeqResult.ReflectionSequences)" }
+                if ($bytecodeSeqResult.UnsafeSequences -gt 0) { $bsDetails += "UnsafeSeq:$($bytecodeSeqResult.UnsafeSequences)" }
+                if ($bytecodeSeqResult.InstrumentSequences -gt 0) { $bsDetails += "InstrSeq:$($bytecodeSeqResult.InstrumentSequences)" }
+                if ($bytecodeSeqResult.JniSequences -gt 0) { $bsDetails += "JNISeq:$($bytecodeSeqResult.JniSequences)" }
+                $advancedReasons += "BYTECODE SEQUENCES (Score: $($bytecodeSeqResult.Score)): $($bsDetails -join ', ')"
+            }
             $cheatEntry = @{
                 FileName = $displayName
                 FilePath = $file.FullName
@@ -3876,6 +4175,10 @@ function Analyze-ModsFolder {
             NativeInfo = $nativeResult
             ArchiveStructureInfo = $archiveStructureResult
             AdvBytecodeInfo = $advBytecodeResult
+            ClassFileInfo = $classFileResult
+            MixinComboInfo = $mixinComboResult
+            StringDecryptorInfo = $stringDecryptorResult
+            BytecodeSeqInfo = $bytecodeSeqResult
         }
     }
     $toMoveToCheat = @()
@@ -3903,6 +4206,10 @@ function Analyze-ModsFolder {
                 if ($mod.NativeInfo -and $mod.NativeInfo.Score -gt 0) { $advDetails += "Native:$($mod.NativeInfo.Score)" }
                 if ($mod.ArchiveStructureInfo -and $mod.ArchiveStructureInfo.Score -gt 0) { $advDetails += "ArchiveStruct:$($mod.ArchiveStructureInfo.Score)" }
                 if ($mod.AdvBytecodeInfo -and $mod.AdvBytecodeInfo.Score -gt 0) { $advDetails += "AdvBC:$($mod.AdvBytecodeInfo.Score)" }
+                if ($mod.ClassFileInfo -and $mod.ClassFileInfo.Score -gt 0) { $advDetails += "ClassFile:$($mod.ClassFileInfo.Score)" }
+                if ($mod.MixinComboInfo -and $mod.MixinComboInfo.Score -gt 0) { $advDetails += "MixinCombo:$($mod.MixinComboInfo.Score)" }
+                if ($mod.StringDecryptorInfo -and $mod.StringDecryptorInfo.Score -gt 0) { $advDetails += "StrDecrypt:$($mod.StringDecryptorInfo.Score)" }
+                if ($mod.BytecodeSeqInfo -and $mod.BytecodeSeqInfo.Score -gt 0) { $advDetails += "ByteSeq:$($mod.BytecodeSeqInfo.Score)" }
                 $reasons += "ADVANCED ANALYSIS (Score: $advScore): $($advDetails -join ', ')"
             }
             $script:CheatMods += @{
@@ -4009,6 +4316,34 @@ function Analyze-ModsFolder {
                     if ($mod.AdvBytecodeInfo.SyntheticMethods -gt 0) { $abDetails += "Synthetic:$($mod.AdvBytecodeInfo.SyntheticMethods)" }
                     if ($mod.AdvBytecodeInfo.DeadCodeClasses -gt 0) { $abDetails += "DeadCode:$($mod.AdvBytecodeInfo.DeadCodeClasses)" }
                     Write-Host "          [AB] Adv Bytecode: $($abDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.ClassFileInfo -and $mod.ClassFileInfo.Score -gt 0) {
+                    $cfDetails = @()
+                    if ($mod.ClassFileInfo.InvokeDynamicCount -gt 0) { $cfDetails += "InvokeDyn:$($mod.ClassFileInfo.InvokeDynamicCount)" }
+                    if ($mod.ClassFileInfo.MethodHandleCount -gt 0) { $cfDetails += "MethodHandle:$($mod.ClassFileInfo.MethodHandleCount)" }
+                    if ($mod.ClassFileInfo.ReflectionRefs -gt 0) { $cfDetails += "Reflect:$($mod.ClassFileInfo.ReflectionRefs)" }
+                    if ($mod.ClassFileInfo.UnsafeRefs -gt 0) { $cfDetails += "Unsafe:$($mod.ClassFileInfo.UnsafeRefs)" }
+                    if ($mod.ClassFileInfo.InstrumentRefs -gt 0) { $cfDetails += "Instr:$($mod.ClassFileInfo.InstrumentRefs)" }
+                    Write-Host "          [CF] ClassFile Heuristics: $($cfDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.MixinComboInfo -and $mod.MixinComboInfo.Score -gt 0) {
+                    $mcDetails = @()
+                    if ($mod.MixinComboInfo.ProfileMatches.Count -gt 0) { $mcDetails += "Profiles:$($mod.MixinComboInfo.ProfileMatches -join ',')" }
+                    Write-Host "          [MC] Mixin Combo: $($mcDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.StringDecryptorInfo -and $mod.StringDecryptorInfo.Score -gt 0) {
+                    $sdDetails = @()
+                    if ($mod.StringDecryptorInfo.DecryptorClasses -gt 0) { $sdDetails += "Decryptors:$($mod.StringDecryptorInfo.DecryptorClasses)" }
+                    if ($mod.StringDecryptorInfo.ClinitStringArrays -gt 0) { $sdDetails += "ClinitArrays:$($mod.StringDecryptorInfo.ClinitStringArrays)" }
+                    Write-Host "          [SD] String Decryptor: $($sdDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.BytecodeSeqInfo -and $mod.BytecodeSeqInfo.Score -gt 0) {
+                    $bsDetails = @()
+                    if ($mod.BytecodeSeqInfo.ReflectionSequences -gt 0) { $bsDetails += "ReflectSeq:$($mod.BytecodeSeqInfo.ReflectionSequences)" }
+                    if ($mod.BytecodeSeqInfo.UnsafeSequences -gt 0) { $bsDetails += "UnsafeSeq:$($mod.BytecodeSeqInfo.UnsafeSequences)" }
+                    if ($mod.BytecodeSeqInfo.InstrumentSequences -gt 0) { $bsDetails += "InstrSeq:$($mod.BytecodeSeqInfo.InstrumentSequences)" }
+                    if ($mod.BytecodeSeqInfo.JniSequences -gt 0) { $bsDetails += "JNISeq:$($mod.BytecodeSeqInfo.JniSequences)" }
+                    Write-Host "          [BS] Bytecode Sequences: $($bsDetails -join ', ')" -ForegroundColor $script:Colors.Warning
                 }
             }
             if ($mod.ZoneId) {
@@ -4185,6 +4520,38 @@ function Analyze-ModsFolder {
                 if ($ab.ExceptionFlood -gt 0) { Write-Host "          Exception handler flooding: $($ab.ExceptionFlood)" -ForegroundColor $script:Colors.Warning }
                 if ($ab.SyntheticMethods -gt 0) { Write-Host "          Synthetic method anomalies: $($ab.SyntheticMethods)" -ForegroundColor $script:Colors.Warning }
                 if ($ab.DeadCodeClasses -gt 0) { Write-Host "          Dead code / junk classes: $($ab.DeadCodeClasses)" -ForegroundColor $script:Colors.Warning }
+            }
+            if ($finding.ClassFileScore -gt 0) {
+                $cf = $finding.ClassFile
+                Write-Host "        [CF] Class-File Heuristics (Score: $($finding.ClassFileScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($cf.InvokeDynamicCount -gt 0) { Write-Host "          InvokeDynamic entries: $($cf.InvokeDynamicCount)" -ForegroundColor $script:Colors.Error }
+                if ($cf.MethodHandleCount -gt 0) { Write-Host "          MethodHandle entries: $($cf.MethodHandleCount)" -ForegroundColor $script:Colors.Error }
+                if ($cf.ReflectionRefs -gt 0) { Write-Host "          Reflection references: $($cf.ReflectionRefs)" -ForegroundColor $script:Colors.Warning }
+                if ($cf.UnsafeRefs -gt 0) { Write-Host "          Unsafe references: $($cf.UnsafeRefs)" -ForegroundColor $script:Colors.Error }
+                if ($cf.InstrumentRefs -gt 0) { Write-Host "          Instrumentation references: $($cf.InstrumentRefs)" -ForegroundColor $script:Colors.Error }
+                if ($cf.NativeMethods -gt 0) { Write-Host "          Native methods: $($cf.NativeMethods)" -ForegroundColor $script:Colors.Error }
+                foreach ($d in ($cf.Details | Select-Object -First 4)) {
+                    Write-Host "          -> $d" -ForegroundColor $script:Colors.Dim
+                }
+            }
+            if ($finding.MixinComboScore -gt 0) {
+                $mc = $finding.MixinCombo
+                Write-Host "        [MC] Mixin Combo Profiles (Score: $($finding.MixinComboScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($mc.ProfileMatches.Count -gt 0) { Write-Host "          Matched profiles: $($mc.ProfileMatches -join ', ')" -ForegroundColor $script:Colors.Error }
+            }
+            if ($finding.StringDecryptorScore -gt 0) {
+                $sd = $finding.StringDecryptor
+                Write-Host "        [SD] String Decryptor Bytecode (Score: $($finding.StringDecryptorScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($sd.DecryptorClasses -gt 0) { Write-Host "          Decryptor classes: $($sd.DecryptorClasses)" -ForegroundColor $script:Colors.Error }
+                if ($sd.ClinitStringArrays -gt 0) { Write-Host "          Heavy <clinit> string arrays: $($sd.ClinitStringArrays)" -ForegroundColor $script:Colors.Warning }
+            }
+            if ($finding.BytecodeSeqScore -gt 0) {
+                $bs = $finding.BytecodeSeq
+                Write-Host "        [BS] Bytecode Sequences (Score: $($finding.BytecodeSeqScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($bs.ReflectionSequences -gt 0) { Write-Host "          Reflection chains: $($bs.ReflectionSequences)" -ForegroundColor $script:Colors.Warning }
+                if ($bs.UnsafeSequences -gt 0) { Write-Host "          Unsafe usage chains: $($bs.UnsafeSequences)" -ForegroundColor $script:Colors.Error }
+                if ($bs.InstrumentSequences -gt 0) { Write-Host "          Instrumentation hooks: $($bs.InstrumentSequences)" -ForegroundColor $script:Colors.Error }
+                if ($bs.JniSequences -gt 0) { Write-Host "          JNI loading sequences: $($bs.JniSequences)" -ForegroundColor $script:Colors.Error }
             }
         }
     }
