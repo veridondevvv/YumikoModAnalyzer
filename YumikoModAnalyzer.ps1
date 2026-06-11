@@ -6,7 +6,7 @@
     [switch]$Silent
 )
 $script:Config = @{
-    Version = "4.5.1"
+    Version = "5.0.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
@@ -16,7 +16,7 @@ $script:Config = @{
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detectwiesoion, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns"
+    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -43,6 +43,7 @@ function Write-Banner {
     Write-Host "    ===========================================================" -ForegroundColor $script:Colors.Dim
     Write-Host "      $($script:Config.Obfuscators) Obfuscators | $($script:Config.ObfuscationPatterns) Patterns | Forensics" -ForegroundColor $script:Colors.Accent
     Write-Host "      Cheat Detection | Injection Scanner | Doomsday Finder" -ForegroundColor $script:Colors.Accent
+    Write-Host "      Nested-JAR Recursion | Resource Pack Scan | JSON Report" -ForegroundColor $script:Colors.Accent
     Write-Host "    ===========================================================" -ForegroundColor $script:Colors.Dim
     Write-Host ""
 }
@@ -176,6 +177,9 @@ $script:BytecodeFindings = @()
 $script:SelfDestructFindings = @()
 $script:EntropyFindings = @()
 $script:MixinFindings = @()
+$script:ResourcePackFindings = @()
+$script:NonJarFindings = @()
+$script:LastModsPath = ""
 function Test-AdminPrivileges {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -1843,8 +1847,81 @@ function Get-StringEntropy {
     }
     return $entropy
 }
+function Get-YumikoPrintableTextFromBytes {
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return "" }
+    $chars = New-Object char[] $Bytes.Length
+    for ($i = 0; $i -lt $Bytes.Length; $i++) {
+        $b = $Bytes[$i]
+        if (($b -ge 32 -and $b -le 126) -or $b -eq 9 -or $b -eq 10 -or $b -eq 13) {
+            $chars[$i] = [char]$b
+        } else {
+            $chars[$i] = ' '
+        }
+    }
+    return -join $chars
+}
+function Get-YumikoJarEntries {
+    # Single-pass JAR reader. Recursively walks nested JARs (Jar-in-Jar / META-INF/jars)
+    # and returns a flat list of entry descriptors so every analyzer sees the SAME data,
+    # including payloads hidden inside embedded jars. Bytes are cached once per entry.
+    param(
+        [string]$FilePath,
+        [int]$MaxDepth = 4,
+        [long]$MaxEntryBytes = 5000000,
+        [long]$MaxNestedJarBytes = 60000000
+    )
+    $entries = New-Object System.Collections.Generic.List[object]
+    $captureExt = '\.(class|java|json|toml|properties|cfg|conf|txt|xml|mf|yml|yaml|info|lang|mcmeta|js|dll|so|dylib|jnilib|html|htm|md|ini|kt|kts|groovy|scala)$'
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    function Read-YumikoArchiveRecursive {
+        param([System.IO.Compression.ZipArchive]$Archive, [int]$Depth, [string]$Prefix)
+        foreach ($entry in $Archive.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            $fullName = if ($Prefix) { "$Prefix!$($entry.FullName)" } else { $entry.FullName }
+            if ($entry.Name -match '\.jar$' -and $Depth -lt $MaxDepth -and $entry.Length -gt 0 -and $entry.Length -lt $MaxNestedJarBytes) {
+                $entries.Add(@{ Path = $fullName; EntryName = $entry.FullName; Name = $entry.Name; Length = $entry.Length; Bytes = $null; Depth = $Depth; IsJar = $true }) | Out-Null
+                try {
+                    $nestedStream = New-Object System.IO.MemoryStream
+                    $entryStream = $entry.Open()
+                    $entryStream.CopyTo($nestedStream)
+                    $entryStream.Close()
+                    $nestedStream.Position = 0
+                    $nestedArchive = New-Object System.IO.Compression.ZipArchive($nestedStream, [System.IO.Compression.ZipArchiveMode]::Read)
+                    Read-YumikoArchiveRecursive -Archive $nestedArchive -Depth ($Depth + 1) -Prefix $fullName
+                    $nestedArchive.Dispose()
+                    $nestedStream.Dispose()
+                } catch {}
+                continue
+            }
+            $bytes = $null
+            if ($entry.Length -gt 0 -and $entry.Length -le $MaxEntryBytes -and $entry.Name -match $captureExt) {
+                try {
+                    $stream = $entry.Open()
+                    $ms = New-Object System.IO.MemoryStream
+                    $stream.CopyTo($ms)
+                    $stream.Close()
+                    $bytes = $ms.ToArray()
+                    $ms.Dispose()
+                } catch {}
+            }
+            $entries.Add(@{ Path = $fullName; EntryName = $entry.FullName; Name = $entry.Name; Length = $entry.Length; Bytes = $bytes; Depth = $Depth; IsJar = $false }) | Out-Null
+        }
+    }
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        Read-YumikoArchiveRecursive -Archive $zip -Depth 0 -Prefix ""
+        $zip.Dispose()
+    } catch {}
+    return ,@($entries.ToArray())
+}
+function Get-YumikoClassEntries {
+    param([object[]]$Entries, [long]$MinLength = 0, [long]$MaxLength = 500000)
+    return @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.Name -match '\.class$' -and $_.Length -gt $MinLength -and $_.Length -lt $MaxLength })
+}
 function Test-Obfuscator {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $results = @{
         Detected = @()
         Score = 0
@@ -1878,15 +1955,13 @@ function Test-Obfuscator {
         RiskLevel = "LOW"
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $allEntries = @($archive.Entries)
+        $allEntries = @($Entries | Where-Object { -not $_.IsJar })
         $contentSamples = @()
         $classNames = @()
         $packagePaths = @()
         $classSizes = @()
         foreach ($entry in $allEntries) {
-            $name = $entry.FullName
+            $name = $entry.EntryName
             if ($name -match "\.class$") {
                 $results.ClassAnalysis.Total++
                 $className = [System.IO.Path]::GetFileNameWithoutExtension(($name -split "/")[-1])
@@ -1985,15 +2060,9 @@ function Test-Obfuscator {
                         }
                     }
                 }
-                if ($contentSamples.Count -lt 50 -and $entry.Length -lt 100000 -and $entry.Length -gt 100) {
+                if ($contentSamples.Count -lt 200 -and $entry.Length -lt 100000 -and $entry.Length -gt 100 -and $entry.Bytes) {
                     try {
-                        $stream = $entry.Open()
-                        $ms = New-Object System.IO.MemoryStream
-                        $stream.CopyTo($ms)
-                        $stream.Close()
-                        $bytes = $ms.ToArray()
-                        $ms.Dispose()
-                        $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+                        $ascii = [System.Text.Encoding]::ASCII.GetString($entry.Bytes)
                         $contentSamples += $ascii
                     } catch {}
                 }
@@ -2027,7 +2096,6 @@ function Test-Obfuscator {
                 }
             }
         }
-        $archive.Dispose()
         $total = [math]::Max(1, $results.ClassAnalysis.Total)
         $numericPct = [math]::Round(($results.ClassAnalysis.Numeric / $total) * 100, 1)
         $unicodePct = [math]::Round(($results.ClassAnalysis.Unicode / $total) * 100, 1)
@@ -2254,7 +2322,7 @@ function Test-MegabaseHash {
     return $null
 }
 function Test-JarURLsAndDomains {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         URLs = [System.Collections.Generic.HashSet[string]]::new()
         Domains = [System.Collections.Generic.HashSet[string]]::new()
@@ -2293,93 +2361,59 @@ function Test-JarURLsAndDomains {
         return $false
     }
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($FilePath)
-        $content = [System.Text.Encoding]::UTF8.GetString($bytes)
-        # Extract URLs
-        $urlMatches = [regex]::Matches($content, $urlPattern)
-        foreach ($match in $urlMatches) {
-            $url = $match.Groups[1].Value
-            $isSafe = $false
-            foreach ($safe in $safeDomains) {
-                if ($url -match [regex]::Escape($safe)) { $isSafe = $true; break }
-            }
-            if (-not $isSafe) {
-                $findings.URLs.Add($url) | Out-Null
-                # Check for suspicious TLD
-                if ($url -match '://([^/]+)') {
-                    $urlDomain = $Matches[1].ToLower()
-                    if (Test-SuspiciousTLD -Domain $urlDomain) {
-                        $findings.SuspiciousTLDs.Add("$urlDomain (from $url)") | Out-Null
-                    }
-                }
-            }
-        }
-        # Extract domains from URLs
-        $domainMatches = [regex]::Matches($content, $domainPattern)
-        foreach ($match in $domainMatches) {
-            $domain = $match.Groups[1].Value.ToLower()
-            if ($domain.Length -gt 4 -and $domain -match '\.') {
+        $textEntries = @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.Name -match '\.(class|json|properties|cfg|conf|yml|yaml|txt|toml|xml|mf|info|html|htm)$' })
+        foreach ($entry in $textEntries) {
+            $content = ""
+            try { $content = [System.Text.Encoding]::UTF8.GetString($entry.Bytes) } catch { continue }
+            # Extract URLs
+            $urlMatches = [regex]::Matches($content, $urlPattern)
+            foreach ($match in $urlMatches) {
+                $url = $match.Groups[1].Value
                 $isSafe = $false
                 foreach ($safe in $safeDomains) {
-                    if ($domain -match [regex]::Escape($safe)) { $isSafe = $true; break }
+                    if ($url -match [regex]::Escape($safe)) { $isSafe = $true; break }
                 }
-                if (-not $isSafe -and $domain -notmatch '^\d+\.\d+\.\d+' -and $domain -notmatch '\.class$' -and $domain -notmatch '\.json$' -and $domain -notmatch '\.jar$' -and $domain -notmatch '\.png$' -and $domain -notmatch '\.txt$' -and $domain -notmatch '\.cfg$' -and $domain -notmatch '\.toml$' -and $domain -notmatch '\.properties$') {
-                    $findings.Domains.Add($domain) | Out-Null
-                    if (Test-SuspiciousTLD -Domain $domain) {
-                        $findings.SuspiciousTLDs.Add($domain) | Out-Null
-                    }
-                }
-            }
-        }
-        # Extract IP addresses
-        $ipMatches = [regex]::Matches($content, $ipPattern)
-        foreach ($match in $ipMatches) {
-            $ip = $match.Groups[1].Value
-            if ($ip -notmatch '^(https?://)?127\.0\.0\.1' -and $ip -notmatch '^(https?://)?0\.0\.0\.0' -and $ip -notmatch '^(https?://)?10\.' -and $ip -notmatch '^(https?://)?192\.168\.' -and $ip -notmatch '^(https?://)?255\.') {
-                $findings.IPs.Add($ip) | Out-Null
-            }
-        }
-        # Also scan individual class/json entries for more precise results
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $entries = $zip.Entries | Where-Object { $_.Name -match '\.(class|json|properties|cfg|yml|yaml|txt)$' }
-        foreach ($entry in $entries) {
-            try {
-                $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
-                $entryContent = $reader.ReadToEnd()
-                $reader.Close()
-                $entryUrlMatches = [regex]::Matches($entryContent, $urlPattern)
-                foreach ($match in $entryUrlMatches) {
-                    $url = $match.Groups[1].Value
-                    $isSafe = $false
-                    foreach ($safe in $safeDomains) {
-                        if ($url -match [regex]::Escape($safe)) { $isSafe = $true; break }
-                    }
-                    if (-not $isSafe) {
-                        $findings.URLs.Add($url) | Out-Null
-                        if ($url -match '://([^/]+)') {
-                            $urlDomain = $Matches[1].ToLower()
-                            if (Test-SuspiciousTLD -Domain $urlDomain) {
-                                $findings.SuspiciousTLDs.Add("$urlDomain (from $url)") | Out-Null
-                            }
+                if (-not $isSafe) {
+                    $findings.URLs.Add($url) | Out-Null
+                    if ($url -match '://([^/]+)') {
+                        $urlDomain = $Matches[1].ToLower()
+                        if (Test-SuspiciousTLD -Domain $urlDomain) {
+                            $findings.SuspiciousTLDs.Add("$urlDomain (from $url)") | Out-Null
                         }
                     }
                 }
-                $entryIpMatches = [regex]::Matches($entryContent, $ipPattern)
-                foreach ($match in $entryIpMatches) {
-                    $ip = $match.Groups[1].Value
-                    if ($ip -notmatch '^(https?://)?127\.0\.0\.1' -and $ip -notmatch '^(https?://)?0\.0\.0\.0' -and $ip -notmatch '^(https?://)?10\.' -and $ip -notmatch '^(https?://)?192\.168\.' -and $ip -notmatch '^(https?://)?255\.') {
-                        $findings.IPs.Add($ip) | Out-Null
+            }
+            # Extract domains
+            $domainMatches = [regex]::Matches($content, $domainPattern)
+            foreach ($match in $domainMatches) {
+                $domain = $match.Groups[1].Value.ToLower()
+                if ($domain.Length -gt 4 -and $domain -match '\.') {
+                    $isSafe = $false
+                    foreach ($safe in $safeDomains) {
+                        if ($domain -match [regex]::Escape($safe)) { $isSafe = $true; break }
+                    }
+                    if (-not $isSafe -and $domain -notmatch '^\d+\.\d+\.\d+' -and $domain -notmatch '\.class$' -and $domain -notmatch '\.json$' -and $domain -notmatch '\.jar$' -and $domain -notmatch '\.png$' -and $domain -notmatch '\.txt$' -and $domain -notmatch '\.cfg$' -and $domain -notmatch '\.toml$' -and $domain -notmatch '\.properties$') {
+                        $findings.Domains.Add($domain) | Out-Null
+                        if (Test-SuspiciousTLD -Domain $domain) {
+                            $findings.SuspiciousTLDs.Add($domain) | Out-Null
+                        }
                     }
                 }
-            } catch {}
+            }
+            # Extract IP addresses
+            $ipMatches = [regex]::Matches($content, $ipPattern)
+            foreach ($match in $ipMatches) {
+                $ip = $match.Groups[1].Value
+                if ($ip -notmatch '^(https?://)?127\.0\.0\.1' -and $ip -notmatch '^(https?://)?0\.0\.0\.0' -and $ip -notmatch '^(https?://)?10\.' -and $ip -notmatch '^(https?://)?192\.168\.' -and $ip -notmatch '^(https?://)?255\.') {
+                    $findings.IPs.Add($ip) | Out-Null
+                }
+            }
         }
-        $zip.Dispose()
     } catch {}
     return $findings
 }
 function Test-BytecodePatterns {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         Reflection = @()
         DynamicLoading = @()
@@ -2389,9 +2423,7 @@ function Test-BytecodePatterns {
         Score = 0
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 100 -and $_.Length -lt 500000 }
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 100 -MaxLength 500000
         $scanned = 0
         $reflectionPatterns = @(
             "java/lang/reflect/Method", "java/lang/reflect/Field", "java/lang/reflect/Constructor",
@@ -2407,7 +2439,9 @@ function Test-BytecodePatterns {
             "java/lang/instrument/Instrumentation", "java/lang/instrument/ClassFileTransformer",
             "jdk/internal/misc/Unsafe", "java.lang.ClassLoader", "defineClass0",
             "java/lang/Runtime;->exec", "ProcessBuilder",
-            "java/lang/invoke/MethodHandles$Lookup;->defineClass"
+            "java/lang/invoke/MethodHandles$Lookup;->defineClass",
+            "net/fabricmc/loader/impl/launch/FabricLauncherBase", "FabricLauncherBase",
+            "addToClassPath", "org/spongepowered/asm/mixin/Mixins", "addConfiguration"
         )
         $networkPatterns = @(
             "java/net/Socket;-><init>", "java/net/HttpURLConnection",
@@ -2454,16 +2488,10 @@ function Test-BytecodePatterns {
             "cglib/proxy/Enhancer", "net/sf/cglib"
         )
         foreach ($entry in $classEntries) {
-            if ($scanned -ge 200) { break }
+            if ($scanned -ge 3000) { break }
             try {
-                $stream = $entry.Open()
-                $ms = New-Object System.IO.MemoryStream
-                $stream.CopyTo($ms)
-                $stream.Close()
-                $bytes = $ms.ToArray()
-                $ms.Dispose()
-                $content = [System.Text.Encoding]::UTF8.GetString($bytes)
-                $className = $entry.FullName -replace '\.class$', ''
+                $content = [System.Text.Encoding]::UTF8.GetString($entry.Bytes)
+                $className = $entry.Path -replace '\.class$', ''
                 foreach ($p in $reflectionPatterns) {
                     if ($content.Contains($p)) {
                         $findings.Reflection += "$className -> $p"
@@ -2497,7 +2525,6 @@ function Test-BytecodePatterns {
                 $scanned++
             } catch {}
         }
-        $zip.Dispose()
         # Score: many reflection + dynamic loading + native = very suspicious
         if ($findings.Reflection.Count -gt 10) { $findings.Score += 15 }
         elseif ($findings.Reflection.Count -gt 5) { $findings.Score += 8 }
@@ -2527,7 +2554,7 @@ function Test-BytecodePatterns {
     return $findings
 }
 function Test-ClassEntropy {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         HighEntropyClasses = @()
         AverageEntropy = 0.0
@@ -2535,20 +2562,13 @@ function Test-ClassEntropy {
         Score = 0
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 500 -and $_.Length -lt 500000 }
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 500 -MaxLength 500000
         $entropyValues = @()
         $scanned = 0
         foreach ($entry in $classEntries) {
-            if ($scanned -ge 150) { break }
+            if ($scanned -ge 2000) { break }
             try {
-                $stream = $entry.Open()
-                $ms = New-Object System.IO.MemoryStream
-                $stream.CopyTo($ms)
-                $stream.Close()
-                $bytes = $ms.ToArray()
-                $ms.Dispose()
+                $bytes = $entry.Bytes
                 # Calculate Shannon entropy on the string constant pool area
                 # Skip first 10 bytes (magic + version), focus on constant pool strings
                 if ($bytes.Length -gt 100) {
@@ -2569,7 +2589,7 @@ function Test-ClassEntropy {
                     $entropyValues += $entropy
                     if ($entropy -gt 7.2) {
                         $findings.HighEntropyClasses += @{
-                            Class = $entry.FullName -replace '\.class$', ''
+                            Class = $entry.Path -replace '\.class$', ''
                             Entropy = [math]::Round($entropy, 3)
                             Size = $entry.Length
                         }
@@ -2579,7 +2599,6 @@ function Test-ClassEntropy {
                 $scanned++
             } catch {}
         }
-        $zip.Dispose()
         if ($entropyValues.Count -gt 0) {
             $findings.AverageEntropy = [math]::Round(($entropyValues | Measure-Object -Average).Average, 3)
         }
@@ -2594,7 +2613,7 @@ function Test-ClassEntropy {
     return $findings
 }
 function Test-MixinConfigs {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         SuspiciousTargets = @()
         MixinConfigs = @()
@@ -2634,18 +2653,14 @@ function Test-MixinConfigs {
     )
     $suspiciousTargetsLower = $suspiciousTargets | ForEach-Object { $_.ToLower() } | Sort-Object -Unique
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $mixinEntries = $zip.Entries | Where-Object { $_.Name -match '\.mixins\.json$|mixin\.json$|mixins\..*\.json$' }
+        $mixinEntries = @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.Name -match '\.mixins\.json$|mixin\.json$|mixins\..*\.json$' })
         foreach ($entry in $mixinEntries) {
             try {
-                $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
-                $content = $reader.ReadToEnd()
-                $reader.Close()
+                $content = [System.Text.Encoding]::UTF8.GetString($entry.Bytes)
                 $json = $content | ConvertFrom-Json -ErrorAction SilentlyContinue
                 if ($null -eq $json) { continue }
                 $configInfo = @{
-                    File = $entry.FullName
+                    File = $entry.Path
                     Package = ""
                     Targets = @()
                 }
@@ -2659,7 +2674,7 @@ function Test-MixinConfigs {
                     foreach ($target in $suspiciousTargetsLower) {
                         if ($classLower -match [regex]::Escape($target)) {
                             $configInfo.Targets += $mixinClass
-                            $findings.SuspiciousTargets += "$($entry.FullName): $mixinClass"
+                            $findings.SuspiciousTargets += "$($entry.Path): $mixinClass"
                             break
                         }
                     }
@@ -2667,7 +2682,6 @@ function Test-MixinConfigs {
                 $findings.MixinConfigs += $configInfo
             } catch {}
         }
-        $zip.Dispose()
         # Score: many suspicious mixin targets = likely cheat
         $targetCount = $findings.SuspiciousTargets.Count
         if ($targetCount -gt 15) { $findings.Score += 30 }
@@ -2693,7 +2707,7 @@ function Test-MixinConfigs {
     return $findings
 }
 function Test-StringEncoding {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         Base64Strings = @()
         CharArrayPatterns = @()
@@ -2707,24 +2721,17 @@ function Test-StringEncoding {
     $charArrayPattern = 'new\s+char\s*\[\s*\]\s*\{[^}]{10,}\}'
     $stringBuilderPattern = '(?:StringBuilder|StringBuffer).*?(?:append\([''"][a-zA-Z]{1,3}[''"]\)[\s.]*){4,}'
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 200 -and $_.Length -lt 500000 }
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 200 -MaxLength 500000
         $scanned = 0
         $totalBase64Hits = 0
         $xorByteRepeatCount = 0
         $stringDecoderCount = 0
         foreach ($entry in $classEntries) {
-            if ($scanned -ge 150) { break }
+            if ($scanned -ge 2000) { break }
             try {
-                $stream = $entry.Open()
-                $ms = New-Object System.IO.MemoryStream
-                $stream.CopyTo($ms)
-                $stream.Close()
-                $bytes = $ms.ToArray()
-                $ms.Dispose()
+                $bytes = $entry.Bytes
                 $content = [System.Text.Encoding]::UTF8.GetString($bytes)
-                $className = $entry.FullName -replace '\.class$', ''
+                $className = $entry.Path -replace '\.class$', ''
                 # Base64 detection: find long Base64 strings, try decode, check for cheat keywords
                 $b64Matches = [regex]::Matches($content, $base64Pattern)
                 foreach ($b64 in $b64Matches) {
@@ -2787,7 +2794,6 @@ function Test-StringEncoding {
                 $scanned++
             } catch {}
         }
-        $zip.Dispose()
         $findings.XorPatterns = $xorByteRepeatCount
         $findings.StringDecoderCount = $stringDecoderCount
         # Scoring
@@ -2808,7 +2814,7 @@ function Test-StringEncoding {
     return $findings
 }
 function Test-RefmapAnalysis {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         SuspiciousRefmaps = @()
         RefmapTargets = @()
@@ -2864,24 +2870,20 @@ function Test-RefmapAnalysis {
         "NbtCompound", "Text"
     )
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        # Find refmap files
-        $refmapEntries = $zip.Entries | Where-Object { $_.Name -match '-refmap\.json$|refmap.*\.json$' }
+        # Find refmap files (incl. nested JARs)
+        $refmapEntries = @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.Name -match '-refmap\.json$|refmap.*\.json$' })
         foreach ($entry in $refmapEntries) {
             try {
-                $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
-                $content = $reader.ReadToEnd()
-                $reader.Close()
+                $content = [System.Text.Encoding]::UTF8.GetString($entry.Bytes)
                 $contentLower = $content.ToLower()
                 $refmapInfo = @{
-                    File = $entry.FullName
+                    File = $entry.Path
                     Targets = @()
                 }
                 foreach ($target in $suspiciousRefmapTargets) {
                     if ($contentLower.Contains($target.ToLower())) {
                         $refmapInfo.Targets += $target
-                        $findings.RefmapTargets += "$($entry.FullName): $target"
+                        $findings.RefmapTargets += "$($entry.Path): $target"
                     }
                 }
                 if ($refmapInfo.Targets.Count -gt 0) {
@@ -2892,12 +2894,11 @@ function Test-RefmapAnalysis {
                     # Count how many intermediary mappings exist
                     $intermediaryCount = ([regex]::Matches($content, "(?:class_|method_|field_)\d+")).Count
                     if ($intermediaryCount -gt 50) {
-                        $findings.RefmapTargets += "$($entry.FullName): $intermediaryCount intermediary mappings (heavy Minecraft patching)"
+                        $findings.RefmapTargets += "$($entry.Path): $intermediaryCount intermediary mappings (heavy Minecraft patching)"
                     }
                 }
             } catch {}
         }
-        $zip.Dispose()
         # Scoring
         $targetCount = $findings.RefmapTargets.Count
         if ($targetCount -gt 20) { $findings.Score += 25 }
@@ -2926,7 +2927,7 @@ function Test-RefmapAnalysis {
     return $findings
 }
 function Test-NativeLibraries {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         NativeFiles = @()
         JniMethods = @()
@@ -2936,32 +2937,25 @@ function Test-NativeLibraries {
     # JNI naming convention: Java_com_package_ClassName_methodName
     $jniPattern = "Java_[a-zA-Z0-9_]{10,}"
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        foreach ($entry in $zip.Entries) {
-            $name = $entry.FullName.ToLower()
+        foreach ($entry in $Entries) {
+            if ($entry.IsJar) { continue }
+            $name = $entry.Path.ToLower()
             foreach ($ext in $nativeExtensions) {
                 if ($name -match $ext) {
                     $severity = "HIGH"
                     if ($name -match '\.(exe|bat|cmd|ps1|sh|vbs)$') { $severity = "CRITICAL" }
                     $findings.NativeFiles += @{
-                        Path = $entry.FullName
+                        Path = $entry.Path
                         Size = $entry.Length
                         Severity = $severity
                     }
                     # For DLL/SO, try to scan for JNI method names
-                    if ($name -match '\.(dll|so|dylib|jnilib)$' -and $entry.Length -lt 5000000 -and $entry.Length -gt 100) {
+                    if ($name -match '\.(dll|so|dylib|jnilib)$' -and $entry.Bytes -and $entry.Length -lt 5000000 -and $entry.Length -gt 100) {
                         try {
-                            $stream = $entry.Open()
-                            $ms = New-Object System.IO.MemoryStream
-                            $stream.CopyTo($ms)
-                            $stream.Close()
-                            $nativeBytes = $ms.ToArray()
-                            $ms.Dispose()
-                            $nativeContent = [System.Text.Encoding]::ASCII.GetString($nativeBytes)
+                            $nativeContent = [System.Text.Encoding]::ASCII.GetString($entry.Bytes)
                             $jniMatches = [regex]::Matches($nativeContent, $jniPattern)
                             foreach ($jni in $jniMatches) {
-                                $findings.JniMethods += "$($entry.FullName): $($jni.Value)"
+                                $findings.JniMethods += "$($entry.Path): $($jni.Value)"
                             }
                         } catch {}
                     }
@@ -2969,7 +2963,6 @@ function Test-NativeLibraries {
                 }
             }
         }
-        $zip.Dispose()
         # Scoring
         $criticalCount = ($findings.NativeFiles | Where-Object { $_.Severity -eq "CRITICAL" }).Count
         $highCount = ($findings.NativeFiles | Where-Object { $_.Severity -eq "HIGH" }).Count
@@ -2982,7 +2975,7 @@ function Test-NativeLibraries {
     return $findings
 }
 function Test-ArchiveStructureAnomalies {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         Flags = @()
         FabricMetadata = @()
@@ -3000,34 +2993,31 @@ function Test-ArchiveStructureAnomalies {
             $findings.Score += $Points
         }
     }
-    function Read-YumikoZipEntryText {
-        param([System.IO.Compression.ZipArchiveEntry]$Entry)
-        try {
-            $reader = New-Object System.IO.StreamReader($Entry.Open(), [System.Text.Encoding]::UTF8)
-            $text = $reader.ReadToEnd()
-            $reader.Close()
-            return $text
-        } catch {}
+    function Read-YumikoCachedEntryText {
+        param($Entry)
+        if ($Entry -and $Entry.Bytes) {
+            try { return [System.Text.Encoding]::UTF8.GetString($Entry.Bytes) } catch {}
+        }
         return ""
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
+        # Container-structure analysis operates on the TOP archive (Depth 0)
+        $topEntries = @($Entries | Where-Object { $_.Depth -eq 0 })
         $entryLookup = @{}
-        foreach ($zipEntry in $zip.Entries) {
-            $entryLookup[$zipEntry.FullName.ToLowerInvariant()] = $true
+        foreach ($zipEntry in $topEntries) {
+            $entryLookup[$zipEntry.EntryName.ToLowerInvariant()] = $true
         }
         function Test-YumikoZipEntryExists {
             param([string]$EntryPath)
             if ([string]::IsNullOrWhiteSpace($EntryPath)) { return $false }
             return $entryLookup.ContainsKey($EntryPath.ToLowerInvariant())
         }
-        $classEntries = @($zip.Entries | Where-Object { $_.FullName -match '\.class$' })
+        $classEntries = @($topEntries | Where-Object { $_.EntryName -match '\.class$' })
         $findings.TotalClasses = $classEntries.Count
-        $embeddedMinecraftClasses = @($classEntries | Where-Object { $_.FullName -match '^net/minecraft/' }).Count
-        $embeddedLoaderRuntimeClasses = @($classEntries | Where-Object { $_.FullName -match '^(net/fabricmc/loader|org/spongepowered/asm|net/fabricmc/tinyremapper)/' }).Count
-        $rootShortPackageClasses = @($classEntries | Where-Object { $_.FullName -match '^[A-Za-z]/' }).Count
-        $compatPackageClasses = @($classEntries | Where-Object { $_.FullName -match '/config/compat/[a-z](?:/|$)' }).Count
+        $embeddedMinecraftClasses = @($classEntries | Where-Object { $_.EntryName -match '^net/minecraft/' }).Count
+        $embeddedLoaderRuntimeClasses = @($classEntries | Where-Object { $_.EntryName -match '^(net/fabricmc/loader|org/spongepowered/asm|net/fabricmc/tinyremapper)/' }).Count
+        $rootShortPackageClasses = @($classEntries | Where-Object { $_.EntryName -match '^[A-Za-z]/' }).Count
+        $compatPackageClasses = @($classEntries | Where-Object { $_.EntryName -match '/config/compat/[a-z](?:/|$)' }).Count
         $findings.EmbeddedPackageCounts = @{
             EmbeddedMinecraft = $embeddedMinecraftClasses
             EmbeddedLoaderRuntime = $embeddedLoaderRuntimeClasses
@@ -3053,26 +3043,26 @@ function Test-ArchiveStructureAnomalies {
         if ($findings.TotalClasses -gt 1500 -and ($embeddedMinecraftClasses -gt 50 -or $rootShortPackageClasses -gt 100)) {
             Add-ArchiveStructureFlag "Oversized mod archive with bundled runtime-like class tree: $($findings.TotalClasses) classes" 10
         }
-        $fabricMetadataEntries = @($zip.Entries | Where-Object { $_.FullName -eq 'fabric.mod.json' -or $_.FullName -match '(^|/)fabric\.mod\.json$' })
+        $fabricMetadataEntries = @($topEntries | Where-Object { $_.EntryName -eq 'fabric.mod.json' -or $_.EntryName -match '(^|/)fabric\.mod\.json$' })
         $topFabricData = $null
         foreach ($fabricEntry in $fabricMetadataEntries) {
-            $fabricText = Read-YumikoZipEntryText -Entry $fabricEntry
+            $fabricText = Read-YumikoCachedEntryText -Entry $fabricEntry
             $fabricData = $fabricText | ConvertFrom-Json -ErrorAction SilentlyContinue
             $metadataId = if ($fabricData -and $fabricData.id) { $fabricData.id } else { "<no id>" }
-            $findings.FabricMetadata += "$($fabricEntry.FullName): $metadataId"
-            if ($fabricEntry.FullName -eq 'fabric.mod.json') { $topFabricData = $fabricData }
+            $findings.FabricMetadata += "$($fabricEntry.EntryName): $metadataId"
+            if ($fabricEntry.EntryName -eq 'fabric.mod.json') { $topFabricData = $fabricData }
         }
         if ($fabricMetadataEntries.Count -gt 1) {
             Add-ArchiveStructureFlag "Multiple Fabric metadata files in one archive: $($fabricMetadataEntries.Count)" 12
         }
-        $looseNestedMetadata = @($fabricMetadataEntries | Where-Object { $_.FullName -match '^META-INF/jars/' })
+        $looseNestedMetadata = @($fabricMetadataEntries | Where-Object { $_.EntryName -match '^META-INF/jars/' })
         if ($looseNestedMetadata.Count -gt 0) {
-            $looseNames = ($looseNestedMetadata | Select-Object -ExpandProperty FullName -First 3) -join ', '
+            $looseNames = ($looseNestedMetadata | Select-Object -ExpandProperty EntryName -First 3) -join ', '
             Add-ArchiveStructureFlag "Loose Fabric metadata under META-INF/jars without nested JAR: $looseNames" 18
         }
-        $loaderEntry = $zip.Entries | Where-Object { $_.FullName -eq 'fabric_loader.json' } | Select-Object -First 1
+        $loaderEntry = $topEntries | Where-Object { $_.EntryName -eq 'fabric_loader.json' } | Select-Object -First 1
         if ($loaderEntry) {
-            $loaderText = Read-YumikoZipEntryText -Entry $loaderEntry
+            $loaderText = Read-YumikoCachedEntryText -Entry $loaderEntry
             $loaderData = $loaderText | ConvertFrom-Json -ErrorAction SilentlyContinue
             if ($loaderData -and $loaderData.id) {
                 Add-ArchiveStructureFlag "Extra fabric_loader.json container metadata: $($loaderData.id)" 15
@@ -3110,15 +3100,15 @@ function Test-ArchiveStructureAnomalies {
                 if ($null -eq $mixinReference) { continue }
                 $mixinPath = if ($mixinReference -is [string]) { $mixinReference } elseif ($mixinReference.PSObject.Properties['config']) { $mixinReference.config } else { $mixinReference.ToString() }
                 if ([string]::IsNullOrWhiteSpace($mixinPath)) { continue }
-                $mixinEntry = $zip.Entries | Where-Object { $_.FullName -eq $mixinPath } | Select-Object -First 1
-                if ($mixinEntry) { $mixinEntryMap[$mixinEntry.FullName] = $mixinEntry }
+                $mixinEntry = $topEntries | Where-Object { $_.EntryName -eq $mixinPath } | Select-Object -First 1
+                if ($mixinEntry) { $mixinEntryMap[$mixinEntry.EntryName] = $mixinEntry }
             }
         }
-        foreach ($jsonEntry in @($zip.Entries | Where-Object { $_.Name -match '(?i)(mixin|mixins|compat).*\.json$' })) {
-            $mixinEntryMap[$jsonEntry.FullName] = $jsonEntry
+        foreach ($jsonEntry in @($topEntries | Where-Object { $_.Name -match '(?i)(mixin|mixins|compat).*\.json$' })) {
+            $mixinEntryMap[$jsonEntry.EntryName] = $jsonEntry
         }
         foreach ($mixinEntry in $mixinEntryMap.Values) {
-            $mixinText = Read-YumikoZipEntryText -Entry $mixinEntry
+            $mixinText = Read-YumikoCachedEntryText -Entry $mixinEntry
             $mixinData = $mixinText | ConvertFrom-Json -ErrorAction SilentlyContinue
             if (-not $mixinData) { continue }
             $mixinClassNames = @()
@@ -3138,7 +3128,7 @@ function Test-ArchiveStructureAnomalies {
             $shortMixinNames = @($mixinClassNames | Where-Object { $_ -match '^(?:[a-z]\.)?[A-Za-z]{1,16}[A-Z]$' -or $_ -match '^[a-z](?:\.[a-z])+\.[A-Za-z]{1,16}[A-Z]$' })
             $shortNameRatio = if ($mixinClassNames.Count -gt 0) { $shortMixinNames.Count / $mixinClassNames.Count } else { 0 }
             $findings.MixinConfigs += @{
-                File = $mixinEntry.FullName
+                File = $mixinEntry.EntryName
                 Package = $packageName
                 Count = $mixinClassNames.Count
                 ShortNameCount = $shortMixinNames.Count
@@ -3146,7 +3136,7 @@ function Test-ArchiveStructureAnomalies {
                 Refmap = $refmapName
             }
             if ($mixinClassNames.Count -ge 30 -and $shortNameRatio -ge 0.7) {
-                Add-ArchiveStructureFlag "Large obfuscated mixin config: $($mixinEntry.FullName) ($($mixinClassNames.Count) classes)" 18
+                Add-ArchiveStructureFlag "Large obfuscated mixin config: $($mixinEntry.EntryName) ($($mixinClassNames.Count) classes)" 18
             }
             if ($requiredMixinConfig -and $mixinClassNames.Count -ge 20 -and $packageName -match '(?i)\.config\.compat\.[a-z](?:\.|$)') {
                 Add-ArchiveStructureFlag "Required compat mixin payload under obfuscated namespace: $packageName" 12
@@ -3156,12 +3146,11 @@ function Test-ArchiveStructureAnomalies {
             }
         }
         $findings.Score = [Math]::Min(90, [int]$findings.Score)
-        $zip.Dispose()
     } catch {}
     return $findings
 }
 function Test-AdvancedBytecodePatterns {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         InvokedynamicAbuse = 0
         ExceptionFlood = 0
@@ -3171,19 +3160,12 @@ function Test-AdvancedBytecodePatterns {
         Score = 0
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $classEntries = $zip.Entries | Where-Object { $_.Name -match '\.class$' -and $_.Length -gt 100 -and $_.Length -lt 500000 }
+        $classEntries = Get-YumikoClassEntries -Entries $Entries -MinLength 100 -MaxLength 500000
         $scanned = 0
         foreach ($entry in $classEntries) {
-            if ($scanned -ge 200) { break }
+            if ($scanned -ge 3000) { break }
             try {
-                $stream = $entry.Open()
-                $ms = New-Object System.IO.MemoryStream
-                $stream.CopyTo($ms)
-                $stream.Close()
-                $bytes = $ms.ToArray()
-                $ms.Dispose()
+                $bytes = $entry.Bytes
                 if ($bytes.Length -lt 20) { $scanned++; continue }
                 # Check Java magic number (0xCAFEBABE)
                 if ($bytes[0] -ne 0xCA -or $bytes[1] -ne 0xFE -or $bytes[2] -ne 0xBA -or $bytes[3] -ne 0xBE) {
@@ -3226,7 +3208,6 @@ function Test-AdvancedBytecodePatterns {
                 $scanned++
             } catch {}
         }
-        $zip.Dispose()
         # Scoring
         $total = [Math]::Max(1, $scanned)
         if ($findings.InvokedynamicAbuse -gt 10) { $findings.Score += 20 }
@@ -3246,46 +3227,43 @@ function Test-AdvancedBytecodePatterns {
     return $findings
 }
 function Test-ManifestSuspicious {
-    param([string]$FilePath)
+    param([object[]]$Entries)
     $findings = @{
         Suspicious = @()
         Score = 0
     }
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        $manifest = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" } | Select-Object -First 1
-        if ($manifest) {
-            $reader = New-Object System.IO.StreamReader($manifest.Open(), [System.Text.Encoding]::UTF8)
-            $content = $reader.ReadToEnd()
-            $reader.Close()
+        $manifests = @($Entries | Where-Object { $_.Bytes -and -not $_.IsJar -and $_.EntryName -match '(^|/)META-INF/MANIFEST\.MF$' })
+        foreach ($manifest in $manifests) {
+            $content = ""
+            try { $content = [System.Text.Encoding]::UTF8.GetString($manifest.Bytes) } catch { continue }
+            $src = if ($manifest.Depth -gt 0) { " [in $($manifest.Path)]" } else { "" }
             if ($content -match "(?i)Premain-Class:") {
-                $findings.Suspicious += "Premain-Class detected (Java Agent injection)"
+                $findings.Suspicious += "Premain-Class detected (Java Agent injection)$src"
                 $findings.Score += 25
             }
             if ($content -match "(?i)Agent-Class:") {
-                $findings.Suspicious += "Agent-Class detected (Java Agent injection)"
+                $findings.Suspicious += "Agent-Class detected (Java Agent injection)$src"
                 $findings.Score += 25
             }
             if ($content -match "(?i)Can-Redefine-Classes:\s*true") {
-                $findings.Suspicious += "Can-Redefine-Classes: true (runtime class modification)"
+                $findings.Suspicious += "Can-Redefine-Classes: true (runtime class modification)$src"
                 $findings.Score += 15
             }
             if ($content -match "(?i)Can-Retransform-Classes:\s*true") {
-                $findings.Suspicious += "Can-Retransform-Classes: true (runtime class modification)"
+                $findings.Suspicious += "Can-Retransform-Classes: true (runtime class modification)$src"
                 $findings.Score += 15
             }
             if ($content -match "(?i)Boot-Class-Path:") {
-                $findings.Suspicious += "Boot-Class-Path detected (bootclasspath injection)"
+                $findings.Suspicious += "Boot-Class-Path detected (bootclasspath injection)$src"
                 $findings.Score += 20
             }
         }
-        $zip.Dispose()
     } catch {}
     return $findings
 }
 function Test-SelfDestructPatterns {
-    param([string]$FilePath)
+    param([object[]]$Entries, [string]$FileName = "")
     # Tightened detector: requires Argon-specific signatures to avoid false positives.
     # Generic patterns ("panic", lone "Argon", "onEnable", setName/clear etc.) are NOT used as triggers.
     $classes = [System.Collections.Generic.HashSet[string]]::new()
@@ -3343,45 +3321,16 @@ function Test-SelfDestructPatterns {
                     $flags.MemoryPurgeDispose = $true
                 }
             }
-            function Scan-YumikoJarArchive {
-                param([System.IO.Compression.ZipArchive]$Archive, [int]$Depth, [string]$Prefix)
-                foreach ($entry in $Archive.Entries) {
-                    $entryName = if ($Prefix) { "$Prefix!$($entry.FullName)" } else { $entry.FullName }
-                    if ($entry.Name -match '\.jar$' -and $Depth -lt 3 -and $entry.Length -gt 0 -and $entry.Length -lt 50000000) {
-                        try {
-                            $nestedStream = New-Object System.IO.MemoryStream
-                            $entryStream = $entry.Open()
-                            $entryStream.CopyTo($nestedStream)
-                            $entryStream.Close()
-                            $nestedStream.Position = 0
-                            $nestedArchive = New-Object System.IO.Compression.ZipArchive($nestedStream, [System.IO.Compression.ZipArchiveMode]::Read)
-                            Scan-YumikoJarArchive -Archive $nestedArchive -Depth ($Depth + 1) -Prefix $entryName
-                            $nestedArchive.Dispose()
-                            $nestedStream.Dispose()
-                        } catch {}
-                        continue
-                    }
-                    if ($entry.Name -match '\.(class|java|json|toml|properties|cfg|txt|xml|mf)$' -and $entry.Length -gt 0 -and $entry.Length -lt 5000000) {
-                        try {
-                            $stream = $entry.Open()
-                            $ms = New-Object System.IO.MemoryStream
-                            $stream.CopyTo($ms)
-                            $stream.Close()
-                            $bytes = $ms.ToArray()
-                            $ms.Dispose()
-                            Test-YumikoSelfDestructContent -EntryName $entryName -Bytes $bytes
-                        } catch {}
+            try {
+                foreach ($e in $Entries) {
+                    if ($e.IsJar -or -not $e.Bytes) { continue }
+                    if ($e.Name -match '\.(class|java|json|toml|properties|cfg|conf|txt|xml|mf)$') {
+                        Test-YumikoSelfDestructContent -EntryName $e.Path -Bytes $e.Bytes
                     }
                 }
-            }
-            try {
-                Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
-                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-                $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-                Scan-YumikoJarArchive -Archive $zip -Depth 0 -Prefix ""
-                $zip.Dispose()
-                $rawBytes = [System.IO.File]::ReadAllBytes($FilePath)
-                Test-YumikoSelfDestructContent -EntryName ([System.IO.Path]::GetFileName($FilePath)) -Bytes $rawBytes
+                if ($FileName) {
+                    Test-YumikoSelfDestructContent -EntryName $FileName -Bytes ([byte[]]@())
+                }
             } catch {}
             $indicators = @()
             $score = 0
@@ -3415,7 +3364,7 @@ function Test-SelfDestructPatterns {
             }
 }
 function Test-CheatStrings {
-    param([string]$FilePath)
+    param([object[]]$Entries, [string]$FileName = "")
     $findings = [System.Collections.Generic.HashSet[string]]::new()
     $fullwidthPattern = "[\uFF21-\uFF3A\uFF41-\uFF5A\uFF10-\uFF19]{2,}"
     $categoryHits = @{
@@ -3457,6 +3406,13 @@ function Test-CheatStrings {
         @{ Label = 'Known cheat package: me/zeroeightsix/kami'; Pattern = 'me[/\\.]zeroeightsix[/\\.]kami' },
         @{ Label = 'Known cheat package: today/opai'; Pattern = 'today[/\\.]opai' },
         @{ Label = 'Known cheat package: xyz/greaj'; Pattern = 'xyz[/\\.]greaj' },
+        @{ Label = 'Known Garnier injector mod id: garnier_injector'; Pattern = 'garnier_injector' },
+        @{ Label = 'Known Garnier injector package: com/garnier/injector'; Pattern = 'com[/\\.]garnier[/\\.]injector' },
+        @{ Label = 'Known Garnier injector config: garnier-injector.txt'; Pattern = 'garnier-injector\.txt' },
+        @{ Label = 'Known Garnier runtime injector package: com/garnier/runtime'; Pattern = 'com[/\\.]garnier[/\\.]runtime' },
+        @{ Label = 'Known Garnier embedded Java agent: garnier-agent.jar'; Pattern = 'garnier-agent\.jar' },
+        @{ Label = 'Known Garnier combat API mod id: fabric-utils-api'; Pattern = 'fabric-utils-api' },
+        @{ Label = 'Known Garnier combat API package: com/garnier/core/features'; Pattern = 'com[/\\.]garnier[/\\.]core[/\\.]features' },
         @{ Label = 'Suspicious refmap: phantom-refmap.json'; Pattern = 'phantom-refmap\.json' },
         @{ Label = 'Suspicious refmap: client-refmap.json'; Pattern = 'client-refmap\.json' },
         @{ Label = 'Suspicious refmap: cheat-refmap.json'; Pattern = 'cheat-refmap\.json' },
@@ -3512,47 +3468,16 @@ function Test-CheatStrings {
             }
         }
     }
-    function Scan-NestedJar {
-        param([System.IO.Stream]$JarStream, [int]$Depth = 0, [int]$MaxDepth = 3, [string]$Prefix = '')
-        if ($Depth -gt $MaxDepth) { return }
-        try {
-            $archive = New-Object System.IO.Compression.ZipArchive($JarStream, [System.IO.Compression.ZipArchiveMode]::Read)
-            foreach ($entry in $archive.Entries) {
-                $entryName = if ($Prefix) { "$Prefix!$($entry.FullName)" } else { $entry.FullName }
-                if ($entry.Name -like '*.jar' -and $Depth -lt $MaxDepth -and $entry.Length -gt 0 -and $entry.Length -lt 50000000) {
-                    try {
-                        $ms = New-Object System.IO.MemoryStream
-                        $entryStream = $entry.Open()
-                        $entryStream.CopyTo($ms)
-                        $entryStream.Close()
-                        $ms.Position = 0
-                        Scan-NestedJar -JarStream $ms -Depth ($Depth + 1) -MaxDepth $MaxDepth -Prefix $entryName
-                        $ms.Dispose()
-                    } catch {}
-                    continue
-                }
-                if ($entry.Name -match '\.(class|json|toml|properties|cfg|txt|xml|mf)$' -and $entry.Length -gt 0 -and $entry.Length -lt 5000000) {
-                    try {
-                        $stream = $entry.Open()
-                        $ms = New-Object System.IO.MemoryStream
-                        $stream.CopyTo($ms)
-                        $stream.Close()
-                        Scan-ContentForCheats -EntryName $entryName -Bytes $ms.ToArray()
-                        $ms.Dispose()
-                    } catch {}
-                }
-            }
-            $archive.Dispose()
-        } catch {}
-    }
     try {
-        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        $rawBytes = [System.IO.File]::ReadAllBytes($FilePath)
-        Scan-ContentForCheats -EntryName ([System.IO.Path]::GetFileName($FilePath)) -Bytes $rawBytes
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
-        Scan-NestedJar -JarStream ([System.IO.File]::OpenRead($FilePath)) -Depth 0 -MaxDepth 3 -Prefix ''
-        $zip.Dispose()
+        foreach ($e in $Entries) {
+            if ($e.IsJar -or -not $e.Bytes) { continue }
+            if ($e.Name -match '\.(class|json|toml|properties|cfg|conf|txt|xml|mf)$') {
+                Scan-ContentForCheats -EntryName $e.Path -Bytes $e.Bytes
+            }
+        }
+        if ($FileName) {
+            Scan-ContentForCheats -EntryName $FileName -Bytes ([byte[]]@())
+        }
     } catch {}
     if ($state.AgentManifest) {
         $findings.Add('Java agent manifest in mod JAR') | Out-Null
@@ -3622,11 +3547,14 @@ function Get-ModInfoFromJar {
 }
 function Get-ModJarFiles {
     param([string]$ModsPath)
-    $jarFiles = @(Get-ChildItem -LiteralPath $ModsPath -Filter "*.jar" -Force -File -ErrorAction SilentlyContinue)
+    # Recurse into sub-folders and also pick up disabled / renamed JARs that cheaters use to evade scans.
+    $allFiles = @(Get-ChildItem -LiteralPath $ModsPath -Recurse -Force -File -ErrorAction SilentlyContinue)
+    $jarFiles = @($allFiles | Where-Object { $_.Name -match '\.jar$' -or $_.Name -match '\.jar\.disabled$' -or $_.Name -match '\.disabled$' -or $_.Name -match '\.jar\.bak$' -or $_.Name -match '\.jar_$' })
     foreach ($jarFile in $jarFiles) {
         $hasHiddenFlag = (([int]$jarFile.Attributes) -band [int][System.IO.FileAttributes]::Hidden) -ne 0
         $hasSystemFlag = (([int]$jarFile.Attributes) -band [int][System.IO.FileAttributes]::System) -ne 0
         $wasHidden = $hasHiddenFlag -or $hasSystemFlag
+        $wasDisabled = $jarFile.Name -match '\.(disabled|bak)$' -or $jarFile.Name -match '\.jar_$'
         $visibilityRestored = $false
         if ($wasHidden) {
             try {
@@ -3637,9 +3565,21 @@ function Get-ModJarFiles {
                 $visibilityRestored = $true
             } catch {}
         }
-        $displayName = if ($wasHidden) { "$($jarFile.Name) (hidden)" } else { $jarFile.Name }
+        # Build a display name that exposes sub-folder location + hidden/disabled status
+        $relative = $jarFile.FullName
+        try {
+            $rootFull = (Resolve-Path -LiteralPath $ModsPath -ErrorAction SilentlyContinue).Path
+            if ($rootFull -and $jarFile.FullName.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $relative = $jarFile.FullName.Substring($rootFull.Length).TrimStart('\', '/')
+            }
+        } catch {}
+        $tags = @()
+        if ($wasHidden) { $tags += "hidden" }
+        if ($wasDisabled) { $tags += "disabled" }
+        $displayName = if ($tags.Count -gt 0) { "$relative ($($tags -join ', '))" } else { $relative }
         $jarFile | Add-Member -NotePropertyName DisplayName -NotePropertyValue $displayName -Force
         $jarFile | Add-Member -NotePropertyName WasHidden -NotePropertyValue $wasHidden -Force
+        $jarFile | Add-Member -NotePropertyName WasDisabled -NotePropertyValue $wasDisabled -Force
         $jarFile | Add-Member -NotePropertyName VisibilityRestored -NotePropertyValue $visibilityRestored -Force
         $jarFile
     }
@@ -3689,10 +3629,32 @@ function Analyze-ModsFolder {
         Write-Result "FAIL" "Mods folder not found" $ModsPath
         return
     }
+    $script:LastModsPath = $ModsPath
+    # Flag non-JAR files that don't belong in a mods folder (renamed payloads, droppers, scripts)
+    $suspiciousNonJarExt = @(".exe", ".dll", ".bat", ".cmd", ".vbs", ".ps1", ".scr", ".com", ".msi", ".lnk", ".zip", ".rar", ".7z", ".py")
+    try {
+        $nonJarFiles = @(Get-ChildItem -LiteralPath $ModsPath -Recurse -Force -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Extension -and ($suspiciousNonJarExt -contains $_.Extension.ToLower()) })
+        foreach ($njf in $nonJarFiles) {
+            $script:NonJarFindings += @{ FileName = $njf.Name; FilePath = $njf.FullName; Extension = $njf.Extension }
+        }
+    } catch {}
     $jarFiles = @(Get-ModJarFiles -ModsPath $ModsPath)
     if ($jarFiles.Count -eq 0) {
         Write-Result "INFO" "No JAR files found in mods folder"
+        if ($script:NonJarFindings.Count -gt 0) {
+            Write-Result "WARN" "Suspicious non-JAR files in mods folder" "$($script:NonJarFindings.Count) file(s)"
+            foreach ($njf in $script:NonJarFindings) { Write-Result "FOUND" "Non-mod file" $njf.FileName }
+        }
         return
+    }
+    if ($script:NonJarFindings.Count -gt 0) {
+        Write-Result "WARN" "Suspicious non-JAR files in mods folder" "$($script:NonJarFindings.Count) file(s)"
+        foreach ($njf in $script:NonJarFindings) { Write-Result "FOUND" "Non-mod file" $njf.FileName }
+    }
+    $disabledJarFiles = @($jarFiles | Where-Object { $_.WasDisabled })
+    if ($disabledJarFiles.Count -gt 0) {
+        Write-Result "WARN" "Disabled/renamed mods detected" "$($disabledJarFiles.Count) file(s) still analyzed"
     }
     $hiddenJarFiles = @($jarFiles | Where-Object { $_.WasHidden })
     if ($hiddenJarFiles.Count -gt 0) {
@@ -3712,7 +3674,9 @@ function Analyze-ModsFolder {
         $counter++
         Write-ProgressBar -Current $counter -Total $total -Activity $displayName
         $hash = Get-SHA1Hash -FilePath $file.FullName
-        $obfResult = Test-Obfuscator -FilePath $file.FullName
+        # Build the JAR entry cache ONCE (recurses into nested Jar-in-Jar). Shared by every analyzer.
+        $entries = Get-YumikoJarEntries -FilePath $file.FullName
+        $obfResult = Test-Obfuscator -Entries $entries
         $hasCriticalObfuscator = ($obfResult.Detected | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
         $isObfuscated = ($obfResult.Score -gt 60) -or $hasCriticalObfuscator
         if ($isObfuscated) {
@@ -3724,7 +3688,7 @@ function Analyze-ModsFolder {
             }
         }
         # Scan for URLs, domains, and IPs
-        $urlFindings = Test-JarURLsAndDomains -FilePath $file.FullName
+        $urlFindings = Test-JarURLsAndDomains -Entries $entries
         if ($urlFindings.URLs.Count -gt 0 -or $urlFindings.IPs.Count -gt 0 -or $urlFindings.SuspiciousTLDs.Count -gt 0) {
             $script:ModURLFindings += @{
                 FileName = $displayName
@@ -3735,7 +3699,7 @@ function Analyze-ModsFolder {
                 SuspiciousTLDs = @($urlFindings.SuspiciousTLDs)
             }
         }
-        $selfDestructResult = Test-SelfDestructPatterns -FilePath $file.FullName
+        $selfDestructResult = Test-SelfDestructPatterns -Entries $entries -FileName $displayName
         if ($selfDestructResult.Detected) {
             $script:SelfDestructFindings += @{
                 FileName = $displayName
@@ -3757,32 +3721,21 @@ function Analyze-ModsFolder {
             }
             continue
         }
+        # Reputation lookup. NOTE: this NO LONGER short-circuits - even Modrinth/Megabase-verified
+        # mods now go through every single deep check below (defense-in-depth).
+        $verifiedInfo = $null
         $modrinthResult = Test-ModrinthHash -Hash $hash
         if ($modrinthResult) {
-            $script:VerifiedMods += @{
-                FileName = $displayName
-                ModName = $modrinthResult.Name
-                Source = $modrinthResult.Source
-                URL = $modrinthResult.URL
-                IsObfuscated = $isObfuscated
-                ObfuscatorInfo = $obfResult
+            $verifiedInfo = @{ Name = $modrinthResult.Name; Source = $modrinthResult.Source; URL = $modrinthResult.URL }
+        } else {
+            $megabaseResult = Test-MegabaseHash -Hash $hash
+            if ($megabaseResult) {
+                $verifiedInfo = @{ Name = $megabaseResult.Name; Source = $megabaseResult.Source; URL = $null }
             }
-            continue
         }
-        $megabaseResult = Test-MegabaseHash -Hash $hash
-        if ($megabaseResult) {
-            $script:VerifiedMods += @{
-                FileName = $displayName
-                ModName = $megabaseResult.Name
-                Source = $megabaseResult.Source
-                IsObfuscated = $isObfuscated
-                ObfuscatorInfo = $obfResult
-            }
-            continue
-        }
-        $cheatStringsFound = Test-CheatStrings -FilePath $file.FullName
+        $cheatStringsFound = Test-CheatStrings -Entries $entries -FileName $displayName
         if ($cheatStringsFound.Count -gt 0) {
-            $script:CheatMods += @{
+            $cheatEntry = @{
                 FileName = $displayName
                 FilePath = $file.FullName
                 StringsFound = @($cheatStringsFound)
@@ -3790,18 +3743,20 @@ function Analyze-ModsFolder {
                 IsObfuscated = $isObfuscated
                 ObfuscatorInfo = $obfResult
             }
+            if ($verifiedInfo) { $cheatEntry.VerifiedAs = "$($verifiedInfo.Name) ($($verifiedInfo.Source))" }
+            $script:CheatMods += $cheatEntry
             continue
         }
         # Advanced detection: Bytecode, Entropy, Mixin, Manifest, String Encoding, Refmap, Native, Advanced Bytecode
-        $bytecodeResult = Test-BytecodePatterns -FilePath $file.FullName
-        $entropyResult = Test-ClassEntropy -FilePath $file.FullName
-        $mixinResult = Test-MixinConfigs -FilePath $file.FullName
-        $manifestResult = Test-ManifestSuspicious -FilePath $file.FullName
-        $stringEncResult = Test-StringEncoding -FilePath $file.FullName
-        $refmapResult = Test-RefmapAnalysis -FilePath $file.FullName
-        $nativeResult = Test-NativeLibraries -FilePath $file.FullName
-        $archiveStructureResult = Test-ArchiveStructureAnomalies -FilePath $file.FullName
-        $advBytecodeResult = Test-AdvancedBytecodePatterns -FilePath $file.FullName
+        $bytecodeResult = Test-BytecodePatterns -Entries $entries
+        $entropyResult = Test-ClassEntropy -Entries $entries
+        $mixinResult = Test-MixinConfigs -Entries $entries
+        $manifestResult = Test-ManifestSuspicious -Entries $entries
+        $stringEncResult = Test-StringEncoding -Entries $entries
+        $refmapResult = Test-RefmapAnalysis -Entries $entries
+        $nativeResult = Test-NativeLibraries -Entries $entries
+        $archiveStructureResult = Test-ArchiveStructureAnomalies -Entries $entries
+        $advBytecodeResult = Test-AdvancedBytecodePatterns -Entries $entries
         $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score
         # Track findings for reporting
         if ($advancedScore -gt 0) {
@@ -3878,13 +3833,28 @@ function Analyze-ModsFolder {
                 if ($advBytecodeResult.DeadCodeClasses -gt 0) { $abcDetails += "DeadCode:$($advBytecodeResult.DeadCodeClasses)" }
                 $advancedReasons += "ADV BYTECODE (Score: $($advBytecodeResult.Score)): $($abcDetails -join ', ')"
             }
-            $script:CheatMods += @{
+            $cheatEntry = @{
                 FileName = $displayName
                 FilePath = $file.FullName
                 StringsFound = $advancedReasons
                 InDependency = $false
                 IsObfuscated = $isObfuscated
                 ObfuscatorInfo = $obfResult
+            }
+            if ($verifiedInfo) { $cheatEntry.VerifiedAs = "$($verifiedInfo.Name) ($($verifiedInfo.Source))" }
+            $script:CheatMods += $cheatEntry
+            continue
+        }
+        # Passed every deep check. If the hash is known-good, label as Verified; otherwise Unknown.
+        if ($verifiedInfo) {
+            $script:VerifiedMods += @{
+                FileName = $displayName
+                ModName = $verifiedInfo.Name
+                Source = $verifiedInfo.Source
+                URL = $verifiedInfo.URL
+                IsObfuscated = $isObfuscated
+                ObfuscatorInfo = $obfResult
+                AdvancedScore = $advancedScore
             }
             continue
         }
@@ -4076,6 +4046,11 @@ function Analyze-ModsFolder {
                 Write-Host "        Hidden in: " -NoNewline -ForegroundColor $script:Colors.Dim
                 Write-Host $mod.DependencyName -ForegroundColor $script:Colors.Error
             }
+            if ($mod.VerifiedAs) {
+                Write-Host "        WARNING: matched a known-good hash (" -NoNewline -ForegroundColor $script:Colors.Warning
+                Write-Host $mod.VerifiedAs -NoNewline -ForegroundColor $script:Colors.Info
+                Write-Host ") but failed deep checks - possible repacked/trojanized mod!" -ForegroundColor $script:Colors.Warning
+            }
             Write-Host "        Detected strings:" -ForegroundColor $script:Colors.Warning
             foreach ($str in @($mod.StringsFound)) {
                 Write-Host "          -> " -NoNewline -ForegroundColor $script:Colors.Dim
@@ -4214,6 +4189,148 @@ function Analyze-ModsFolder {
         }
     }
 }
+function Test-YumikoResourcePack {
+    param([string]$Name, [object[]]$Items, [string]$MetaText)
+    $hits = @()
+    $score = 0
+    $relList = @($Items | ForEach-Object { $_.Rel })
+    $combined = (($Name + "`n" + $MetaText + "`n" + ($relList -join "`n"))).ToLower()
+    $keywords = @{
+        'X-ray wording'        = 'xray|x-ray|x ray|seethrough|see-through|see through|transparent block'
+        'Fullbright wording'   = 'fullbright|full bright|full-bright|no fog|nofog|gamma'
+        'Cave/Ore finder'      = 'cavefinder|cave finder|orefinder|ore finder|oresee|cave view|caveview'
+        'Hitbox/Reach'         = 'hitbox|hit box|\breach\b'
+        'Cheat/Hack wording'   = '\bcheat\b|\bhack\b|ghost client|bypass|\bglow\b ore'
+        'Nuker/AutoClicker'    = 'nuker|autoclick|auto click|autoclicker'
+    }
+    foreach ($k in $keywords.Keys) {
+        if ($combined -match $keywords[$k]) { $hits += "keyword: $k"; $score += 18 }
+    }
+    # X-ray heuristic: a high share of near-empty (transparent) block textures
+    $blockTex = @($Items | Where-Object { $_.Rel -match 'textures/blocks?/.*\.png$' })
+    if ($blockTex.Count -ge 20) {
+        $tiny = @($blockTex | Where-Object { $_.Size -gt 0 -and $_.Size -lt 300 }).Count
+        $ratio = if ($blockTex.Count -gt 0) { $tiny / $blockTex.Count } else { 0 }
+        if ($ratio -ge 0.5) {
+            $hits += "X-ray heuristic: $([math]::Round($ratio*100))% of $($blockTex.Count) block textures are near-empty (<300B)"
+            $score += 40
+        } elseif ($ratio -ge 0.25) {
+            $hits += "Possible X-ray: $([math]::Round($ratio*100))% of $($blockTex.Count) block textures near-empty"
+            $score += 20
+        }
+    }
+    if ($combined -match '/optifine/cit' -or $combined -match 'optifine[\\/]cit') { $hits += 'OptiFine CIT (custom item textures) present'; $score += 5 }
+    return @{ Name = $Name; Hits = $hits; Score = $score }
+}
+function Analyze-ResourcePacks {
+    param([string]$ModsPath)
+    Write-Section "Resource Pack Analysis (X-Ray / Fullbright / Hitbox)" "RP"
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+    $candidatePaths.Add("$env:APPDATA\.minecraft\resourcepacks") | Out-Null
+    $candidatePaths.Add("$env:APPDATA\.minecraft\texturepacks") | Out-Null
+    try {
+        $parent = Split-Path -Parent $ModsPath
+        if ($parent) {
+            $candidatePaths.Add((Join-Path $parent 'resourcepacks')) | Out-Null
+            $candidatePaths.Add((Join-Path $parent 'texturepacks')) | Out-Null
+        }
+    } catch {}
+    $packRoots = @($candidatePaths | Sort-Object -Unique | Where-Object { Test-Path $_ -PathType Container })
+    if ($packRoots.Count -eq 0) {
+        Write-Result "INFO" "No resourcepacks folder found"
+        return
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $found = $false
+    foreach ($root in $packRoots) {
+        $packEntries = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue |
+                         Where-Object { $_.PSIsContainer -or $_.Name -match '\.zip$' })
+        foreach ($pack in $packEntries) {
+            $items = New-Object System.Collections.Generic.List[object]
+            $metaText = ""
+            try {
+                if ($pack.PSIsContainer) {
+                    $files = @(Get-ChildItem -LiteralPath $pack.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | Select-Object -First 8000)
+                    $rootLen = $pack.FullName.Length
+                    foreach ($f in $files) {
+                        $rel = $f.FullName.Substring([Math]::Min($rootLen, $f.FullName.Length)).TrimStart('\','/').Replace('\','/')
+                        $items.Add(@{ Rel = $rel; Size = $f.Length }) | Out-Null
+                        if ($f.Name -ieq 'pack.mcmeta' -and $f.Length -lt 100000) {
+                            try { $metaText += (Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue) } catch {}
+                        }
+                    }
+                } else {
+                    $zip = [System.IO.Compression.ZipFile]::OpenRead($pack.FullName)
+                    try {
+                        foreach ($entry in $zip.Entries) {
+                            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+                            $items.Add(@{ Rel = $entry.FullName.Replace('\','/'); Size = $entry.Length }) | Out-Null
+                            if ($entry.Name -ieq 'pack.mcmeta' -and $entry.Length -lt 100000) {
+                                try {
+                                    $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+                                    $metaText += $reader.ReadToEnd()
+                                    $reader.Close()
+                                } catch {}
+                            }
+                        }
+                    } finally { $zip.Dispose() }
+                }
+            } catch {}
+            if ($items.Count -eq 0) { continue }
+            $result = Test-YumikoResourcePack -Name $pack.Name -Items $items.ToArray() -MetaText $metaText
+            if ($result.Score -ge 20) {
+                $found = $true
+                $severity = if ($result.Score -ge 40) { "FOUND" } else { "WARN" }
+                Write-Result $severity "Suspicious resource pack" "$($pack.Name) (Score: $($result.Score))"
+                foreach ($h in $result.Hits) { Write-Result "INFO" "  -> $h" }
+                $script:ResourcePackFindings += @{
+                    Name = $pack.Name
+                    Path = $pack.FullName
+                    Score = $result.Score
+                    Hits = $result.Hits
+                }
+            }
+        }
+    }
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious resource packs detected"
+    }
+}
+function Export-YumikoModReport {
+    $report = [ordered]@{
+        tool          = $script:Config.Name
+        version       = $script:Config.Version
+        edition       = $script:Config.Edition
+        generatedUtc  = (Get-Date).ToUniversalTime().ToString("o")
+        modsPath      = $script:LastModsPath
+        summary       = [ordered]@{
+            verified          = $script:VerifiedMods.Count
+            unknown           = $script:UnknownMods.Count
+            cheats            = $script:CheatMods.Count
+            disallowed        = $script:DisallowedModsFound.Count
+            resourcePackFlags = $script:ResourcePackFindings.Count
+            nonJarFiles       = $script:NonJarFindings.Count
+            systemFindings    = $script:SystemFindings.Count
+        }
+        cheatMods     = @($script:CheatMods | ForEach-Object { [ordered]@{ file = $_.FileName; obfuscated = [bool]$_.IsObfuscated; verifiedAs = $_.VerifiedAs; reasons = @($_.StringsFound) } })
+        unknownMods   = @($script:UnknownMods | ForEach-Object { [ordered]@{ file = $_.FileName; obfuscated = [bool]$_.IsObfuscated; advancedScore = $_.AdvancedScore } })
+        verifiedMods  = @($script:VerifiedMods | ForEach-Object { [ordered]@{ file = $_.FileName; mod = $_.ModName; source = $_.Source; obfuscated = [bool]$_.IsObfuscated; advancedScore = $_.AdvancedScore } })
+        disallowedMods= @($script:DisallowedModsFound | ForEach-Object { [ordered]@{ file = $_.FileName; mod = $_.ModName } })
+        resourcePacks = @($script:ResourcePackFindings | ForEach-Object { [ordered]@{ pack = $_.Name; score = $_.Score; hits = @($_.Hits) } })
+        nonJarFiles   = @($script:NonJarFindings | ForEach-Object { [ordered]@{ file = $_.FileName; path = $_.FilePath } })
+        urlFindings   = @($script:ModURLFindings | ForEach-Object { [ordered]@{ file = $_.FileName; urls = @($_.URLs); ips = @($_.IPs); suspiciousTlds = @($_.SuspiciousTLDs) } })
+        systemFindings= @($script:SystemFindings | ForEach-Object { [ordered]@{ type = $_.Type; description = $_.Description; severity = $_.Severity } })
+    }
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $outDir = if ($PSScriptRoot) { $PSScriptRoot } else { [Environment]::GetFolderPath('Desktop') }
+    $outFile = Join-Path $outDir "YumikoReport-$stamp.json"
+    try {
+        $report | ConvertTo-Json -Depth 6 | Out-File -FilePath $outFile -Encoding utf8 -ErrorAction Stop
+        return $outFile
+    } catch {
+        return $null
+    }
+}
 function Get-MinecraftUptime {
     Write-Section "Minecraft Process Status" "MC"
     $process = Get-Process javaw -ErrorAction SilentlyContinue
@@ -4287,11 +4404,18 @@ function Run-ModAnalysis {
     $inputPath = Read-Host
     if ([string]::IsNullOrWhiteSpace($inputPath)) { $inputPath = $defaultPath }
     Analyze-ModsFolder -ModsPath $inputPath
+    Analyze-ResourcePacks -ModsPath $inputPath
     Write-Section "Mod Analysis Summary" "SUM"
     Write-Result "INFO" "Verified" "$($script:VerifiedMods.Count) mod(s)"
     Write-Result "INFO" "Unknown" "$($script:UnknownMods.Count) mod(s)"
     if ($script:DisallowedModsFound.Count -gt 0) {
         Write-Result "WARN" "Disallowed" "$($script:DisallowedModsFound.Count) mod(s)"
+    }
+    if ($script:ResourcePackFindings.Count -gt 0) {
+        Write-Result "WARN" "Resource packs" "$($script:ResourcePackFindings.Count) suspicious pack(s)"
+    }
+    if ($script:NonJarFindings.Count -gt 0) {
+        Write-Result "WARN" "Non-JAR files" "$($script:NonJarFindings.Count) suspicious file(s) in mods folder"
     }
     $totalMods = $script:VerifiedMods.Count + $script:UnknownMods.Count + $script:CheatMods.Count
     $obfuscatedVerified = ($script:VerifiedMods | Where-Object { $_.IsObfuscated }).Count
@@ -4309,6 +4433,11 @@ function Run-ModAnalysis {
         Write-Result "WARN" "CHEATS DETECTED" "$($script:CheatMods.Count) suspicious mod(s)"
     } else {
         Write-Result "PASS" "No cheat mods detected"
+    }
+    $reportPath = Export-YumikoModReport
+    if ($reportPath) {
+        Write-Host ""
+        Write-Result "INFO" "JSON report saved" $reportPath
     }
 }
 if ($env:YUMIKO_TEST -eq "1") {
