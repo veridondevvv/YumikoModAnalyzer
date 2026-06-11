@@ -6,17 +6,17 @@
     [switch]$Silent
 )
 $script:Config = @{
-    Version = "5.1.0"
+    Version = "5.2.0"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
     ModrinthAPI = "https://api.modrinth.com/v2"
     MegabaseAPI = "https://megabase.vercel.app/api/query"
-    CheatSignatures = "650+"
+    CheatSignatures = "700+"
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export, Class-File Heuristics, Mixin Combo Profiles, String Decryptor Bytecode Detection, Bytecode Sequence Patterns, Extended Memory Signatures"
+    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export, Class-File Heuristics, Mixin Combo Profiles, String Decryptor Bytecode Detection, Bytecode Sequence Patterns, Extended Memory Signatures, Discord Exfiltration Detection, Shaded Package Detection, Alternate Data Stream Forensics"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -3485,6 +3485,136 @@ function Test-BytecodeSequencePatterns {
     } catch {}
     return $findings
 }
+function Test-DiscordExfiltration {
+    param([object[]]$Entries)
+    $findings = @{
+        WebhookURLs = @()
+        WebhookPatterns = 0
+        RpcPatterns = 0
+        ExfilKeywords = 0
+        Score = 0
+        Details = @()
+    }
+    try {
+        $webhookRegex = 'discord(?:app)?\.com/api/webhooks/\d{17,19}/[A-Za-z0-9_-]{68}'
+        $webhookKeywords = @('DiscordWebhook','WebhookClient','sendEmbed','executeWebhook','setContent','addEmbed','setUsername','setAvatar','sendMessage')
+        $rpcKeywords = @('DiscordRichPresence','DiscordRPC','DiscordEventHandlers','updatePresence','DiscordActivity')
+        $exfilKeywords = @('TokenLogger','TokenGrabber','SessionStealer','CredentialStealer','BrowserStealer','PasswordStealer','DiscordToken','SessionToken','MinecraftToken','CookieStealer')
+        $relevantEntries = $Entries | Where-Object {
+            $_.EntryName -match '\.(class|json|properties|cfg|txt|conf|yml|yaml)$' -or
+            $_.EntryName -notmatch '\.(png|jpg|jpeg|gif|ogg|wav|mp3|ttf|woff|frag|vert|glsl|bin|dat)$'
+        }
+        foreach ($entry in $relevantEntries) {
+            try {
+                if ($null -eq $entry.Bytes -or $entry.Bytes.Length -eq 0) { continue }
+                $text = [System.Text.Encoding]::UTF8.GetString($entry.Bytes)
+                # Webhook URLs
+                $matches = [regex]::Matches($text, $webhookRegex)
+                foreach ($m in $matches) {
+                    if ($m.Value -notin $findings.WebhookURLs) {
+                        $findings.WebhookURLs += $m.Value
+                        $findings.WebhookPatterns++
+                    }
+                }
+                # Keywords (limit one hit per entry to avoid inflation)
+                $hasWebhook = $false; $hasRpc = $false; $hasExfil = $false
+                foreach ($kw in $webhookKeywords) {
+                    if ($text -match [regex]::Escape($kw)) { $hasWebhook = $true; break }
+                }
+                foreach ($kw in $rpcKeywords) {
+                    if ($text -match [regex]::Escape($kw)) { $hasRpc = $true; break }
+                }
+                foreach ($kw in $exfilKeywords) {
+                    if ($text -match [regex]::Escape($kw)) { $hasExfil = $true; break }
+                }
+                if ($hasWebhook) { $findings.WebhookPatterns++ }
+                if ($hasRpc) { $findings.RpcPatterns++ }
+                if ($hasExfil) { $findings.ExfilKeywords++ }
+            } catch {}
+        }
+        if ($findings.WebhookURLs.Count -gt 0) { $findings.Score += 40; $findings.Details += "Webhook URLs: $($findings.WebhookURLs.Count)" }
+        if ($findings.WebhookPatterns -gt 0) { $findings.Score += 20; $findings.Details += "Webhook patterns: $($findings.WebhookPatterns)" }
+        if ($findings.RpcPatterns -gt 0) { $findings.Score += 10; $findings.Details += "Discord RPC: $($findings.RpcPatterns)" }
+        if ($findings.ExfilKeywords -gt 0) { $findings.Score += 25; $findings.Details += "Exfil keywords: $($findings.ExfilKeywords)" }
+        if ($findings.Score -gt 80) { $findings.Score = 80 }
+    } catch {}
+    return $findings
+}
+function Test-ShadedPackages {
+    param([object[]]$Entries)
+    $findings = @{
+        ShadedCount = 0
+        RelocatedCount = 0
+        DeepNestedSingleLetter = 0
+        KnownLibUnderForeignRoot = 0
+        Score = 0
+        Details = @()
+    }
+    try {
+        $classEntries = $Entries | Where-Object { $_.EntryName -match '\.class$' }
+        $knownLibs = @(
+            'okhttp3/','com/google/gson/','org/apache/http/',
+            'io/netty/','com/squareup/','org/jetbrains/',
+            'org/slf4j/','org/apache/commons/',
+            'com/fasterxml/jackson/','org/json/','com/google/common/'
+        )
+        foreach ($entry in $classEntries) {
+            $path = $entry.EntryName
+            $parts = ($path -replace '\.class$','') -split '/'
+            if ($path -match '/(shaded|relocated|shadow|thirdparty|deps|libraries|vendor)/') {
+                $findings.ShadedCount++
+            }
+            if ($path -match '/relocated/') { $findings.RelocatedCount++ }
+            $singleLetterDepth = 0
+            foreach ($p in $parts) {
+                if ($p -match '^[a-z]$') { $singleLetterDepth++ } else { break }
+            }
+            if ($singleLetterDepth -ge 4) { $findings.DeepNestedSingleLetter++ }
+            foreach ($lib in $knownLibs) {
+                if ($path -match [regex]::Escape($lib)) {
+                    if (-not ($path -match '^' + [regex]::Escape($lib))) {
+                        $findings.KnownLibUnderForeignRoot++
+                        break
+                    }
+                }
+            }
+        }
+        if ($findings.ShadedCount -gt 20) { $findings.Score += 15; $findings.Details += "Shaded classes: $($findings.ShadedCount)" }
+        elseif ($findings.ShadedCount -gt 0) { $findings.Score += 8 }
+        if ($findings.RelocatedCount -gt 0) { $findings.Score += 10; $findings.Details += "Relocated classes: $($findings.RelocatedCount)" }
+        if ($findings.DeepNestedSingleLetter -gt 50) { $findings.Score += 20; $findings.Details += "Deep single-letter nesting: $($findings.DeepNestedSingleLetter)" }
+        elseif ($findings.DeepNestedSingleLetter -gt 10) { $findings.Score += 10 }
+        if ($findings.KnownLibUnderForeignRoot -gt 0) { $findings.Score += 15; $findings.Details += "Known libs under foreign root: $($findings.KnownLibUnderForeignRoot)" }
+        if ($findings.Score -gt 60) { $findings.Score = 60 }
+    } catch {}
+    return $findings
+}
+function Test-AlternateDataStreams {
+    param([string]$FilePath)
+    $findings = @{
+        StreamCount = 0
+        SuspiciousStreams = @()
+        TotalSuspiciousSize = 0
+        Score = 0
+    }
+    try {
+        if (-not (Test-Path $FilePath)) { return $findings }
+        $streams = Get-Item -LiteralPath $FilePath -Stream * -ErrorAction SilentlyContinue
+        foreach ($stream in $streams) {
+            $name = $stream.Stream
+            if ($name -eq ':Zone.Identifier' -or $name -eq ':Zone.Identifier:$DATA' -or $name -eq ':$DATA') { continue }
+            $findings.StreamCount++
+            $size = if ($stream.Length) { $stream.Length } else { 0 }
+            $findings.SuspiciousStreams += "$name ($([math]::Round($size/1KB,1)) KB)"
+            $findings.TotalSuspiciousSize += $size
+            if ($size -gt 1024) { $findings.Score += 15 }
+            else { $findings.Score += 8 }
+            if ($name -match 'hidden|payload|data|secret|config|cheat|inject') { $findings.Score += 10 }
+        }
+        if ($findings.Score -gt 50) { $findings.Score = 50 }
+    } catch {}
+    return $findings
+}
 function Test-ManifestSuspicious {
     param([object[]]$Entries)
     $findings = @{
@@ -4020,7 +4150,10 @@ function Analyze-ModsFolder {
         $mixinComboResult = Test-MixinComboProfiles -Entries $entries
         $stringDecryptorResult = Test-StringDecryptorBytecode -Entries $entries
         $bytecodeSeqResult = Test-BytecodeSequencePatterns -Entries $entries
-        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score + $classFileResult.Score + $mixinComboResult.Score + $stringDecryptorResult.Score + $bytecodeSeqResult.Score
+        $discordResult = Test-DiscordExfiltration -Entries $entries
+        $shadedResult = Test-ShadedPackages -Entries $entries
+        $adsResult = Test-AlternateDataStreams -FilePath $file.FullName
+        $advancedScore = $bytecodeResult.Score + $entropyResult.Score + $mixinResult.Score + $manifestResult.Score + $stringEncResult.Score + $refmapResult.Score + $nativeResult.Score + $archiveStructureResult.Score + $advBytecodeResult.Score + $classFileResult.Score + $mixinComboResult.Score + $stringDecryptorResult.Score + $bytecodeSeqResult.Score + $discordResult.Score + $shadedResult.Score + $adsResult.Score
         # Track findings for reporting
         if ($advancedScore -gt 0) {
             $script:BytecodeFindings += @{
@@ -4038,6 +4171,9 @@ function Analyze-ModsFolder {
                 MixinComboScore = $mixinComboResult.Score
                 StringDecryptorScore = $stringDecryptorResult.Score
                 BytecodeSeqScore = $bytecodeSeqResult.Score
+                DiscordScore = $discordResult.Score
+                ShadedScore = $shadedResult.Score
+                AdsScore = $adsResult.Score
                 TotalAdvancedScore = $advancedScore
                 Bytecode = $bytecodeResult
                 Entropy = $entropyResult
@@ -4052,6 +4188,9 @@ function Analyze-ModsFolder {
                 MixinCombo = $mixinComboResult
                 StringDecryptor = $stringDecryptorResult
                 BytecodeSeq = $bytecodeSeqResult
+                Discord = $discordResult
+                Shaded = $shadedResult
+                Ads = $adsResult
             }
         }
         # If advanced analysis flags this mod as highly suspicious, mark as cheat
@@ -4132,6 +4271,25 @@ function Analyze-ModsFolder {
                 if ($bytecodeSeqResult.JniSequences -gt 0) { $bsDetails += "JNISeq:$($bytecodeSeqResult.JniSequences)" }
                 $advancedReasons += "BYTECODE SEQUENCES (Score: $($bytecodeSeqResult.Score)): $($bsDetails -join ', ')"
             }
+            if ($discordResult.Score -gt 0) {
+                $dcDetails = @()
+                if ($discordResult.WebhookURLs.Count -gt 0) { $dcDetails += "WebhookURLs:$($discordResult.WebhookURLs.Count)" }
+                if ($discordResult.WebhookPatterns -gt 0) { $dcDetails += "WebhookPatterns:$($discordResult.WebhookPatterns)" }
+                if ($discordResult.RpcPatterns -gt 0) { $dcDetails += "RPC:$($discordResult.RpcPatterns)" }
+                if ($discordResult.ExfilKeywords -gt 0) { $dcDetails += "Exfil:$($discordResult.ExfilKeywords)" }
+                $advancedReasons += "DISCORD EXFILTRATION (Score: $($discordResult.Score)): $($dcDetails -join ', ')"
+            }
+            if ($shadedResult.Score -gt 0) {
+                $shDetails = @()
+                if ($shadedResult.ShadedCount -gt 0) { $shDetails += "Shaded:$($shadedResult.ShadedCount)" }
+                if ($shadedResult.RelocatedCount -gt 0) { $shDetails += "Relocated:$($shadedResult.RelocatedCount)" }
+                if ($shadedResult.DeepNestedSingleLetter -gt 0) { $shDetails += "DeepNest:$($shadedResult.DeepNestedSingleLetter)" }
+                if ($shadedResult.KnownLibUnderForeignRoot -gt 0) { $shDetails += "ForeignLib:$($shadedResult.KnownLibUnderForeignRoot)" }
+                $advancedReasons += "SHADED PACKAGES (Score: $($shadedResult.Score)): $($shDetails -join ', ')"
+            }
+            if ($adsResult.Score -gt 0) {
+                $advancedReasons += "ALTERNATE DATA STREAMS (Score: $($adsResult.Score)): Streams=$($adsResult.StreamCount), Size=$([math]::Round($adsResult.TotalSuspiciousSize/1KB,1)) KB"
+            }
             $cheatEntry = @{
                 FileName = $displayName
                 FilePath = $file.FullName
@@ -4179,6 +4337,9 @@ function Analyze-ModsFolder {
             MixinComboInfo = $mixinComboResult
             StringDecryptorInfo = $stringDecryptorResult
             BytecodeSeqInfo = $bytecodeSeqResult
+            DiscordInfo = $discordResult
+            ShadedInfo = $shadedResult
+            AdsInfo = $adsResult
         }
     }
     $toMoveToCheat = @()
@@ -4210,6 +4371,9 @@ function Analyze-ModsFolder {
                 if ($mod.MixinComboInfo -and $mod.MixinComboInfo.Score -gt 0) { $advDetails += "MixinCombo:$($mod.MixinComboInfo.Score)" }
                 if ($mod.StringDecryptorInfo -and $mod.StringDecryptorInfo.Score -gt 0) { $advDetails += "StrDecrypt:$($mod.StringDecryptorInfo.Score)" }
                 if ($mod.BytecodeSeqInfo -and $mod.BytecodeSeqInfo.Score -gt 0) { $advDetails += "ByteSeq:$($mod.BytecodeSeqInfo.Score)" }
+                if ($mod.DiscordInfo -and $mod.DiscordInfo.Score -gt 0) { $advDetails += "Discord:$($mod.DiscordInfo.Score)" }
+                if ($mod.ShadedInfo -and $mod.ShadedInfo.Score -gt 0) { $advDetails += "Shaded:$($mod.ShadedInfo.Score)" }
+                if ($mod.AdsInfo -and $mod.AdsInfo.Score -gt 0) { $advDetails += "ADS:$($mod.AdsInfo.Score)" }
                 $reasons += "ADVANCED ANALYSIS (Score: $advScore): $($advDetails -join ', ')"
             }
             $script:CheatMods += @{
@@ -4344,6 +4508,28 @@ function Analyze-ModsFolder {
                     if ($mod.BytecodeSeqInfo.InstrumentSequences -gt 0) { $bsDetails += "InstrSeq:$($mod.BytecodeSeqInfo.InstrumentSequences)" }
                     if ($mod.BytecodeSeqInfo.JniSequences -gt 0) { $bsDetails += "JNISeq:$($mod.BytecodeSeqInfo.JniSequences)" }
                     Write-Host "          [BS] Bytecode Sequences: $($bsDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.DiscordInfo -and $mod.DiscordInfo.Score -gt 0) {
+                    $dcDetails = @()
+                    if ($mod.DiscordInfo.WebhookURLs.Count -gt 0) { $dcDetails += "WebhookURLs:$($mod.DiscordInfo.WebhookURLs.Count)" }
+                    if ($mod.DiscordInfo.WebhookPatterns -gt 0) { $dcDetails += "WebhookPatterns:$($mod.DiscordInfo.WebhookPatterns)" }
+                    if ($mod.DiscordInfo.RpcPatterns -gt 0) { $dcDetails += "RPC:$($mod.DiscordInfo.RpcPatterns)" }
+                    if ($mod.DiscordInfo.ExfilKeywords -gt 0) { $dcDetails += "Exfil:$($mod.DiscordInfo.ExfilKeywords)" }
+                    Write-Host "          [DC] Discord Exfiltration: $($dcDetails -join ', ')" -ForegroundColor $script:Colors.Error
+                }
+                if ($mod.ShadedInfo -and $mod.ShadedInfo.Score -gt 0) {
+                    $shDetails = @()
+                    if ($mod.ShadedInfo.ShadedCount -gt 0) { $shDetails += "Shaded:$($mod.ShadedInfo.ShadedCount)" }
+                    if ($mod.ShadedInfo.RelocatedCount -gt 0) { $shDetails += "Relocated:$($mod.ShadedInfo.RelocatedCount)" }
+                    if ($mod.ShadedInfo.DeepNestedSingleLetter -gt 0) { $shDetails += "DeepNest:$($mod.ShadedInfo.DeepNestedSingleLetter)" }
+                    if ($mod.ShadedInfo.KnownLibUnderForeignRoot -gt 0) { $shDetails += "ForeignLib:$($mod.ShadedInfo.KnownLibUnderForeignRoot)" }
+                    Write-Host "          [SH] Shaded Packages: $($shDetails -join ', ')" -ForegroundColor $script:Colors.Warning
+                }
+                if ($mod.AdsInfo -and $mod.AdsInfo.Score -gt 0) {
+                    Write-Host "          [AD] Alternate Data Streams: $($mod.AdsInfo.StreamCount) stream(s), $([math]::Round($mod.AdsInfo.TotalSuspiciousSize/1KB,1)) KB" -ForegroundColor $script:Colors.Error
+                    foreach ($s in ($mod.AdsInfo.SuspiciousStreams | Select-Object -First 3)) {
+                        Write-Host "               -> $s" -ForegroundColor $script:Colors.Dim
+                    }
                 }
             }
             if ($mod.ZoneId) {
@@ -4552,6 +4738,32 @@ function Analyze-ModsFolder {
                 if ($bs.UnsafeSequences -gt 0) { Write-Host "          Unsafe usage chains: $($bs.UnsafeSequences)" -ForegroundColor $script:Colors.Error }
                 if ($bs.InstrumentSequences -gt 0) { Write-Host "          Instrumentation hooks: $($bs.InstrumentSequences)" -ForegroundColor $script:Colors.Error }
                 if ($bs.JniSequences -gt 0) { Write-Host "          JNI loading sequences: $($bs.JniSequences)" -ForegroundColor $script:Colors.Error }
+            }
+            if ($finding.DiscordScore -gt 0) {
+                $dc = $finding.Discord
+                Write-Host "        [DC] Discord Exfiltration (Score: $($finding.DiscordScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($dc.WebhookURLs.Count -gt 0) { Write-Host "          Webhook URLs: $($dc.WebhookURLs.Count)" -ForegroundColor $script:Colors.Error }
+                if ($dc.WebhookPatterns -gt 0) { Write-Host "          Webhook patterns: $($dc.WebhookPatterns)" -ForegroundColor $script:Colors.Warning }
+                if ($dc.RpcPatterns -gt 0) { Write-Host "          Discord RPC: $($dc.RpcPatterns)" -ForegroundColor $script:Colors.Warning }
+                if ($dc.ExfilKeywords -gt 0) { Write-Host "          Exfil keywords: $($dc.ExfilKeywords)" -ForegroundColor $script:Colors.Error }
+            }
+            if ($finding.ShadedScore -gt 0) {
+                $sh = $finding.Shaded
+                Write-Host "        [SH] Shaded Packages (Score: $($finding.ShadedScore)):" -ForegroundColor $script:Colors.Secondary
+                if ($sh.ShadedCount -gt 0) { Write-Host "          Shaded classes: $($sh.ShadedCount)" -ForegroundColor $script:Colors.Warning }
+                if ($sh.RelocatedCount -gt 0) { Write-Host "          Relocated classes: $($sh.RelocatedCount)" -ForegroundColor $script:Colors.Warning }
+                if ($sh.DeepNestedSingleLetter -gt 0) { Write-Host "          Deep single-letter nesting: $($sh.DeepNestedSingleLetter)" -ForegroundColor $script:Colors.Warning }
+                if ($sh.KnownLibUnderForeignRoot -gt 0) { Write-Host "          Known libs under foreign root: $($sh.KnownLibUnderForeignRoot)" -ForegroundColor $script:Colors.Error }
+                foreach ($d in ($sh.Details | Select-Object -First 4)) {
+                    Write-Host "          -> $d" -ForegroundColor $script:Colors.Dim
+                }
+            }
+            if ($finding.AdsScore -gt 0) {
+                $ad = $finding.Ads
+                Write-Host "        [AD] Alternate Data Streams (Score: $($finding.AdsScore)):" -ForegroundColor $script:Colors.Secondary
+                foreach ($s in ($ad.SuspiciousStreams | Select-Object -First 4)) {
+                    Write-Host "          -> $s" -ForegroundColor $script:Colors.Error
+                }
             }
         }
     }
