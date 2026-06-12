@@ -6,7 +6,7 @@
     [switch]$Silent
 )
 $script:Config = @{
-    Version = "5.2.0"
+    Version = "5.2.1"
     Author = "Veridon"
     Name = "Yumiko Mod Analyzer"
     Edition = "FREE ULTIMATE"
@@ -16,7 +16,7 @@ $script:Config = @{
     SystemChecks = "40+"
     Obfuscators = "20+"
     ObfuscationPatterns = "19+"
-    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export, Class-File Heuristics, Mixin Combo Profiles, String Decryptor Bytecode Detection, Bytecode Sequence Patterns, Extended Memory Signatures, Discord Exfiltration Detection, Shaded Package Detection, Alternate Data Stream Forensics"
+    Features = "JVM Scan, Bypass Detection, String Analysis, Advanced Obfuscation Detection, Doomsday Detection, Memory Forensics, Prefetch Analysis, Fabric/Forge Injection Detection, Disallowed Mods, Bytecode Analysis, Entropy Analysis, Mixin Config Analysis, String Encoding Detection, Refmap Analysis, Native Library Detection, Advanced Bytecode Patterns, Nested JAR (Jar-in-Jar) Recursion, Resource Pack Analysis, Full Verified-Mod Deep Scan, JSON Report Export, Class-File Heuristics, Mixin Combo Profiles, String Decryptor Bytecode Detection, Bytecode Sequence Patterns, Extended Memory Signatures, Discord Exfiltration Detection, Shaded Package Detection, Alternate Data Stream Forensics, Active Network Connection Analysis"
 }
 $script:Colors = @{
     Primary    = "Magenta"
@@ -1763,6 +1763,101 @@ function Check-FabricForgeInjection {
     }
     if (-not $found) {
         Write-Result "CLEAN" "No JVM injection patterns detected"
+    }
+}
+function Check-ActiveConnections {
+    Write-Section "Active Network Connection Analysis" "NET"
+    $found = $false
+    $javaProcesses = Get-Process -Name javaw, java -ErrorAction SilentlyContinue
+    if ($javaProcesses.Count -eq 0) {
+        Write-Result "INFO" "No Java processes found" "Start Minecraft for live connection analysis"
+        return
+    }
+    $suspiciousPorts = @(8080, 4444, 1337, 5555, 9999, 6666, 7777, 8888, 31337, 6667, 6697, 1080, 9050, 9150)
+    $legitimateHosts = @(
+        'mojang.com', 'minecraft.net', 'microsoft.com', 'xboxlive.com',
+        'modrinth.com', 'curseforge.com', 'cursecdn.com', 'optifine.net',
+        'minecraftservices.com', 'minecraft-physics-mod.com',
+        'discord.gg', 'discord.com', 'discordapp.com',
+        'cloudflare.com', 'fastly.com', 'akamaized.net',
+        'google.com', 'googleapis.com', 'youtube.com', 'gstatic.com',
+        'github.com', 'githubusercontent.com', 'gitlab.com',
+        'pastebin.com', 'hastebin.com', 'mcpaste.com',
+        'java.com', 'oracle.com', 'eclipse.org', 'jetbrains.com',
+        'twitch.tv', 'jtvnw.net', 'cloudfront.net',
+        'namemc.com', 'planetminecraft.com'
+    )
+    $privateRanges = @('10.', '192.168.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.')
+    foreach ($proc in $javaProcesses) {
+        try {
+            $connections = Get-NetTCPConnection -OwningProcess $proc.Id -ErrorAction Stop
+            if ($connections.Count -eq 0) { continue }
+            $external = @($connections | Where-Object { $_.RemoteAddress -notmatch '^127\.' -and $_.RemoteAddress -notmatch '^0\.' -and $_.State -eq 'Established' })
+            if ($external.Count -eq 0) { continue }
+            $suspiciousConns = @()
+            foreach ($conn in $external) {
+                $remote = $conn.RemoteAddress
+                $port = $conn.RemotePort
+                $isSuspicious = $false
+                $reason = ""
+                # Suspicious port
+                if ($port -in $suspiciousPorts) {
+                    $isSuspicious = $true
+                    $reason = "Suspicious port $port"
+                }
+                # Private IP on non-Minecraft port
+                $isPrivate = $false
+                foreach ($pr in $privateRanges) { if ($remote.StartsWith($pr)) { $isPrivate = $true; break } }
+                if ($isPrivate -and $port -ne 25565 -and $port -notin @(80, 443, 8080)) {
+                    $isSuspicious = $true
+                    $reason = "LAN/private connection on port $port"
+                }
+                # Direct IP (no known hostname) on non-standard port
+                if ($remote -match '^\d+\.\d+\.\d+\.\d+$' -and $port -notin @(80, 443, 8080, 25565)) {
+                    $isSuspicious = $true
+                    $reason = "Direct IP connection $remote`:$port"
+                }
+                # Filter out known legitimate hosts
+                $isLegit = $false
+                foreach ($hostPat in $legitimateHosts) {
+                    try {
+                        $resolved = [System.Net.Dns]::GetHostEntry($remote)
+                        if ($resolved -and $resolved.HostName -match $hostPat) { $isLegit = $true; break }
+                    } catch {}
+                    # Also check if the IP itself is part of a known CDN/legit range (simplified: skip strict DNS)
+                }
+                if ($isLegit) { continue }
+                if ($isSuspicious) {
+                    $suspiciousConns += "$remote`:$port ($reason)"
+                    $found = $true
+                }
+            }
+            # Many external connections from one javaw is suspicious
+            if ($external.Count -gt 8 -and $suspiciousConns.Count -eq 0) {
+                $found = $true
+                Write-Result "FOUND" "High connection count" "$($external.Count) external connections from PID $($proc.Id)"
+                $script:SystemFindings += @{
+                    Type = "ActiveConnection"
+                    Description = "PID $($proc.Id) has $($external.Count) external TCP connections"
+                    PID = $proc.Id
+                    Severity = "WARNING"
+                }
+            }
+            foreach ($sc in $suspiciousConns) {
+                Write-Result "FOUND" "Suspicious connection" "$sc (PID: $($proc.Id))"
+                $script:SystemFindings += @{
+                    Type = "ActiveConnection"
+                    Description = "Suspicious connection: $sc"
+                    PID = $proc.Id
+                    Severity = "CRITICAL"
+                }
+            }
+        } catch {
+            # Get-NetTCPConnection may require elevated privileges
+        }
+    }
+    if (-not $found) {
+        Write-Result "CLEAN" "No suspicious active connections detected"
     }
 }
 $script:CheatStrings = @(
@@ -4961,6 +5056,7 @@ function Run-SystemAnalysis {
     Check-PrefetchFiles
     Check-DoomsdayRegistry
     Check-FabricForgeInjection
+    Check-ActiveConnections
     Write-Section "System Analysis Summary" "SUM"
     if ($script:SystemFindings.Count -gt 0) {
         Write-Result "WARN" "Total findings" "$($script:SystemFindings.Count) suspicious item(s) detected"
